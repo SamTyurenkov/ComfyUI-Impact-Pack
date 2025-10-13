@@ -149,6 +149,8 @@ app.registerExtension({
 			let clipspaceMasksWidget = node.widgets.find(obj => obj.name === 'clipspace_masks');
 			if(!clipspaceMasksWidget) {
 				// Create hidden widget for clipspace_masks
+				// serialize: true so it gets sent to backend during execution
+				// But we'll clear it after backend processes it to avoid bloating localStorage
 				clipspaceMasksWidget = {
 					name: 'clipspace_masks',
 					type: 'clipspace_masks',
@@ -164,6 +166,21 @@ app.registerExtension({
 				clipspaceMasksWidget.value = {};
 				console.log("[PreviewBridgeVideo] Initialized clipspace_masks widget value to empty object");
 			}
+			
+			// Hook into execution lifecycle to clear masks after they're sent to backend
+			const originalOnExecuted = node.onExecuted;
+			node.onExecuted = function(message) {
+				// Clear the widget value after execution to prevent localStorage bloat
+				// The backend has cached the masks in node_cache, so they'll be restored from there
+				if(clipspaceMasksWidget.value && Object.keys(clipspaceMasksWidget.value).length > 0) {
+					console.log("[PreviewBridgeVideo] Clearing clipspace_masks widget after execution (backend has cached them)");
+					clipspaceMasksWidget.value = {};
+				}
+				
+				if(originalOnExecuted) {
+					return originalOnExecuted.apply(this, arguments);
+				}
+			};
 			
 			// Store the original array to protect it during clipspace operations
 			let preservedImgs = null;
