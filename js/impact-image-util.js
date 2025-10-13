@@ -252,7 +252,7 @@ app.registerExtension({
 						w.value = str;
 						
 						// On the second clipspace call (the painted-masked image), update the edited frame
-						// This is also where we extract and store the mask data
+						// This is also where we store a reference to the clipspace file (not raw data!)
 						if(clipspaceImageCount === 2 && editedFrameIndex !== null && editedFrameIndex >= 0 && editedFrameIndex < preservedImgs.length && v && v[0]) {
 							console.log("[PreviewBridgeVideo] Updating frame", editedFrameIndex, "with clipspace image");
 							preservedImgs[editedFrameIndex] = v[0];
@@ -260,58 +260,29 @@ app.registerExtension({
 							node._imgs = [...preservedImgs];
 							console.log("[PreviewBridgeVideo] Updated preview with edited frame", editedFrameIndex);
 							
-							// Extract mask data from the clipspace image and store it
-							// The mask editor returns an image with alpha channel containing the mask
-							// We need to extract this and store it in clipspace_masks widget
+							// Store a lightweight reference to the clipspace file instead of raw mask data
+							// This prevents memory bloat while still allowing the backend to load masks
 							try {
-								// Create a canvas to extract the alpha channel
-								const canvas = document.createElement('canvas');
-								const img = v[0];
-								
-								// IMPORTANT: Capture editedFrameIndex in closure BEFORE it gets reset to null
 								const frameIndex = editedFrameIndex;
 								
-								// Wait for image to load if needed
-								const extractMask = () => {
-									canvas.width = img.naturalWidth || img.width;
-									canvas.height = img.naturalHeight || img.height;
-									const ctx = canvas.getContext('2d');
-									ctx.drawImage(img, 0, 0);
-									
-									// Get image data to extract alpha channel
-									const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-									const alphaData = [];
-									
-									// Extract alpha channel (every 4th value in the data array)
-									for(let i = 3; i < imageData.data.length; i += 4) {
-										alphaData.push(imageData.data[i]);
-									}
-									
-									// Store the mask data with dimensions
-									const maskData = {
-										width: canvas.width,
-										height: canvas.height,
-										data: alphaData
-									};
-									
-									// Ensure clipspaceMasksWidget.value is an object before setting property
-									if(typeof clipspaceMasksWidget.value !== 'object' || clipspaceMasksWidget.value === null) {
-										clipspaceMasksWidget.value = {};
-										console.log("[PreviewBridgeVideo] Reset clipspaceMasksWidget.value to empty object");
-									}
-									
-									// Use the captured frameIndex, not editedFrameIndex which may be null by now
-									clipspaceMasksWidget.value[frameIndex] = maskData;
-									console.log("[PreviewBridgeVideo] Extracted and stored mask for frame", frameIndex, "size:", canvas.width, "x", canvas.height);
-								};
-								
-								if(img.complete && img.naturalWidth) {
-									extractMask();
-								} else {
-									img.onload = extractMask;
+								// Parse the clipspace filename from the URL
+								let sp = new URLSearchParams(v[0].src.split("?")[1]);
+								let clipspaceFile = "";
+								if(sp.get('subfolder')) {
+									clipspaceFile += sp.get('subfolder') + '/';
 								}
+								clipspaceFile += `${sp.get("filename")} [${sp.get("type")}]`;
+								
+								// Ensure clipspaceMasksWidget.value is an object
+								if(typeof clipspaceMasksWidget.value !== 'object' || clipspaceMasksWidget.value === null) {
+									clipspaceMasksWidget.value = {};
+								}
+								
+								// Store just the file reference - much smaller than raw data!
+								clipspaceMasksWidget.value[frameIndex] = clipspaceFile;
+								console.log("[PreviewBridgeVideo] Stored clipspace file reference for frame", frameIndex, ":", clipspaceFile);
 							} catch(e) {
-								console.error("[PreviewBridgeVideo] Failed to extract mask data:", e);
+								console.error("[PreviewBridgeVideo] Failed to store clipspace reference:", e);
 							}
 						}
 						

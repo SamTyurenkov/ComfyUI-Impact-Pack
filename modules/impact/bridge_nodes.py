@@ -523,10 +523,11 @@ class PreviewBridgeVideo:
         self.prev_hash = None
 
     @staticmethod
-    def convert_clipspace_masks_to_tensors(clipspace_masks):
+    def convert_clipspace_masks_to_tensors(clipspace_masks, unique_id):
         """Convert clipspace_masks from frontend format to torch tensors.
         
-        Frontend format: {index: {width: int, height: int, data: [alpha values]}}
+        Frontend format (new): {index: "clipspace/filename.png [input]"} - file reference
+        Frontend format (old): {index: {width: int, height: int, data: [alpha values]}} - raw data
         Backend format: {index: torch.Tensor}
         """
         if not clipspace_masks or not isinstance(clipspace_masks, dict):
@@ -548,7 +549,19 @@ class PreviewBridgeVideo:
                     converted[idx] = mask_data
                     continue
                 
-                # Convert from frontend format
+                # NEW: Handle file reference (string path)
+                if isinstance(mask_data, str):
+                    # Register the clipspace file and load the mask from it
+                    if PreviewBridge.register_clipspace_image(mask_data, unique_id):
+                        if mask_data in core.preview_bridge_image_id_map:
+                            _, loaded_mask, _ = PreviewBridgeVideo.load_image(mask_data)
+                            converted[idx] = loaded_mask
+                            logging.info(f"[PreviewBridgeVideo] Loaded clipspace mask for frame {idx} from file: {mask_data}")
+                        else:
+                            logging.warning(f"[PreviewBridgeVideo] Failed to load clipspace file for frame {idx}: {mask_data}")
+                    continue
+                
+                # OLD: Convert from raw data format (backwards compatibility)
                 if isinstance(mask_data, dict) and 'width' in mask_data and 'height' in mask_data and 'data' in mask_data:
                     width = mask_data['width']
                     height = mask_data['height']
@@ -564,7 +577,7 @@ class PreviewBridgeVideo:
                     # Convert to tensor and add batch dimension
                     mask_tensor = torch.from_numpy(mask_array).unsqueeze(0)
                     converted[idx] = mask_tensor
-                    logging.info(f"[PreviewBridgeVideo] Converted clipspace mask for frame {idx}: {width}x{height}")
+                    logging.info(f"[PreviewBridgeVideo] Converted raw clipspace mask for frame {idx}: {width}x{height}")
                 else:
                     logging.warning(f"[PreviewBridgeVideo] Invalid clipspace mask format for index {idx}: {type(mask_data)}")
             except Exception as e:
@@ -638,7 +651,7 @@ class PreviewBridgeVideo:
             logging.info(f"[PreviewBridgeVideo] Converted clipspace_masks list to dict")
         
         # Convert clipspace_masks from frontend format (if needed) to torch tensors
-        clipspace_masks = PreviewBridgeVideo.convert_clipspace_masks_to_tensors(clipspace_masks)
+        clipspace_masks = PreviewBridgeVideo.convert_clipspace_masks_to_tensors(clipspace_masks, unique_id)
         
         logging.info(f"[PreviewBridgeVideo] Clipspace masks count: {len(clipspace_masks)}")
         logging.info(f"[PreviewBridgeVideo] Clipspace mask frames: {list(clipspace_masks.keys())}")
