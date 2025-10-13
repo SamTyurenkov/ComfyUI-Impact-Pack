@@ -192,6 +192,7 @@ NODE_CLASS_MAPPINGS = {
 
     "PreviewBridge": PreviewBridge, # noqa: F405
     "PreviewBridgeLatent": PreviewBridgeLatent, # noqa: F405
+    "PreviewBridgeVideo": PreviewBridgeVideo, # noqa: F405
     "ImageSender": ImageSender, # noqa: F405
     "ImageReceiver": ImageReceiver, # noqa: F405
     "LatentSender": LatentSender, # noqa: F405
@@ -391,6 +392,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
     "PreviewBridge": "Preview Bridge (Image)",
     "PreviewBridgeLatent": "Preview Bridge (Latent)",
+    "PreviewBridgeVideo": "Preview Bridge (Video)",
     "ImageSender": "Image Sender",
     "ImageReceiver": "Image Receiver",
     "ImageMaskSwitch": "Switch (images, mask)",

@@ -7,6 +7,7 @@ import nodes
 from PIL import Image
 import numpy as np
 from impact import utils
+import re
 
 # NOTE: this should not be `from . import core`.
 # I don't know why but... 'from .' and 'from impact' refer to different core modules.
@@ -486,5 +487,326 @@ class PreviewBridgeLatent:
 
         return {
             "ui": {"images": res_image},
+            "result": result,
+        }
+
+
+class PreviewBridgeVideo:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "images": ("IMAGE",),
+                    "image": ("STRING", {"default": ""}),
+                    },
+                "optional": {
+                    "masks": ("MASK",),
+                    "block": ("BOOLEAN", {"default": False, "label_on": "if_empty_mask", "label_off": "never", "tooltip": "is_empty_mask: If all masks are empty, the execution is stopped.\nnever: The execution is never stopped."}),
+                    "restore_mask": (["if_same_size", "always", "never"], {"tooltip": "if_same_size: If the input image is the same size as the previous image, restore the last saved masks (default)\nalways: Always restore the last saved masks, even when input images change\nnever: Do not restore masks - start fresh each time"}),
+                    },
+                "hidden": {"unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO"},
+                }
+
+    RETURN_TYPES = ("IMAGE", "MASK", )
+
+    FUNCTION = "doit"
+
+    OUTPUT_NODE = True
+
+    CATEGORY = "ImpactPack/Util"
+
+    DESCRIPTION = "This is a feature that allows you to edit masks for individual frames in a batch of images.\nClick on any frame preview and open in MaskEditor to edit its mask.\nAll frames and their masks are preserved.\nIf the block is set to 'is_empty_mask', the execution is stopped when all masks are empty."
+
+    def __init__(self):
+        super().__init__()
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.prev_hash = None
+
+    @staticmethod
+    def load_image(pb_id):
+        is_fail = False
+        if pb_id not in core.preview_bridge_image_id_map:
+            is_fail = True
+
+        if not is_fail:
+            image_path, ui_item = core.preview_bridge_image_id_map[pb_id]
+            if not os.path.isfile(image_path):
+                is_fail = True
+
+        if not is_fail:
+            i = Image.open(image_path)
+            i = ImageOps.exif_transpose(i)
+            image = i.convert("RGB")
+            image = np.array(image).astype(np.float32) / 255.0
+            image = torch.from_numpy(image)[None,]
+
+            if 'A' in i.getbands():
+                mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
+                mask = 1. - torch.from_numpy(mask)
+            else:
+                mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+        else:
+            image = utils.empty_pil_tensor()
+            mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+            ui_item = {
+                "filename": 'empty.png',
+                "subfolder": '',
+                "type": 'temp'
+            }
+
+        return image, mask.unsqueeze(0), ui_item
+
+    def doit(self, images, image, unique_id, masks=None, block=False, restore_mask="if_same_size", prompt=None, extra_pnginfo=None):
+        batch_size = images.shape[0]
+        
+        logging.info(f"[PreviewBridgeVideo] === Execution Start ===")
+        logging.info(f"[PreviewBridgeVideo] unique_id={unique_id}, batch_size={batch_size}, restore_mask={restore_mask}")
+        logging.info(f"[PreviewBridgeVideo] image param='{image[:50] if image else 'None'}...'")
+        
+        # Use a special cache key structure to avoid conflicts with regular PreviewBridge
+        video_cache_key = f"{unique_id}_video"
+        
+        if video_cache_key not in core.preview_bridge_cache:
+            core.preview_bridge_cache[video_cache_key] = {}
+            logging.info(f"[PreviewBridgeVideo] Created new preview cache")
+        if video_cache_key not in core.preview_bridge_last_mask_cache:
+            core.preview_bridge_last_mask_cache[video_cache_key] = {}
+            logging.info(f"[PreviewBridgeVideo] Created new mask cache")
+
+        node_cache = core.preview_bridge_cache[video_cache_key]
+        node_mask_cache = core.preview_bridge_last_mask_cache[video_cache_key]
+        
+        logging.info(f"[PreviewBridgeVideo] Cached masks count: {len(node_mask_cache)}")
+        logging.info(f"[PreviewBridgeVideo] Cached mask frames: {list(node_mask_cache.keys())}")
+        
+        # Check if images have changed
+        images_changed = False
+        if 'images_ref' not in node_cache or node_cache['images_ref'] is not images:
+            images_changed = True
+            node_cache['images_ref'] = images
+            logging.info(f"[PreviewBridgeVideo] Images CHANGED - clearing cache if restore_mask='never'")
+            # Clear mask cache if images changed and restore_mask is "never"
+            if restore_mask == "never":
+                node_mask_cache.clear()
+                logging.info(f"[PreviewBridgeVideo] Cleared mask cache (restore_mask='never')")
+        else:
+            logging.info(f"[PreviewBridgeVideo] Images UNCHANGED")
+        
+        # Initialize masks if not provided
+        if masks is None:
+            masks = torch.zeros((batch_size, images.shape[1], images.shape[2]), dtype=torch.float32, device="cpu")
+        elif masks.shape[0] != batch_size:
+            # Resize mask batch to match image batch size
+            if masks.shape[0] == 1:
+                masks = masks.repeat(batch_size, 1, 1)
+            else:
+                new_masks = torch.zeros((batch_size, images.shape[1], images.shape[2]), dtype=torch.float32, device="cpu")
+                copy_size = min(batch_size, masks.shape[0])
+                new_masks[:copy_size] = masks[:copy_size]
+                masks = new_masks
+        
+        # Restore masks from cache if needed
+        # Restore masks if: restore_mask is "always", OR restore_mask is not "never" and images haven't changed
+        should_restore = (restore_mask == "always") or (restore_mask != "never" and not images_changed)
+        
+        logging.info(f"[PreviewBridgeVideo] Should restore masks: {should_restore}")
+        
+        if should_restore:
+            restored_count = 0
+            for idx in range(batch_size):
+                if idx in node_mask_cache:
+                    cached_mask = node_mask_cache[idx]
+                    logging.info(f"[PreviewBridgeVideo] Found cached mask for frame {idx}, shape: {cached_mask.shape}")
+                    # Check size compatibility for "if_same_size"
+                    if restore_mask == "if_same_size" and images_changed:
+                        if cached_mask.shape[1:] == masks.shape[1:3]:
+                            masks[idx] = cached_mask.squeeze(0)
+                            restored_count += 1
+                            logging.info(f"[PreviewBridgeVideo] Restored mask for frame {idx} (if_same_size with image change)")
+                        else:
+                            logging.info(f"[PreviewBridgeVideo] Skipped frame {idx} - size mismatch: {cached_mask.shape[1:]} vs {masks.shape[1:3]}")
+                    else:
+                        # For "always" or when images haven't changed, restore regardless
+                        if cached_mask.shape[1:] == masks.shape[1:3]:
+                            masks[idx] = cached_mask.squeeze(0)
+                            restored_count += 1
+                            logging.info(f"[PreviewBridgeVideo] Restored mask for frame {idx}")
+                        else:
+                            logging.info(f"[PreviewBridgeVideo] Skipped frame {idx} - size mismatch: {cached_mask.shape[1:]} vs {masks.shape[1:3]}")
+            logging.info(f"[PreviewBridgeVideo] Total masks restored: {restored_count}/{batch_size}")
+
+        # Check if this is a fresh run or coming back from mask editor
+        is_fresh_run = not image or image.startswith(f"${unique_id}")
+        logging.info(f"[PreviewBridgeVideo] is_fresh_run: {is_fresh_run}")
+        
+        # Handle mask editor return (clipspace)
+        if not is_fresh_run and image:
+            logging.info(f"[PreviewBridgeVideo] Processing clipspace return...")
+            # Try to load the edited image with mask from clipspace
+            is_clipspace = "clipspace" in image.lower() or "[input]" in image
+            logging.info(f"[PreviewBridgeVideo] is_clipspace: {is_clipspace}")
+            
+            if is_clipspace:
+                PreviewBridge.register_clipspace_image(image, unique_id)
+            
+            if image in core.preview_bridge_image_id_map:
+                logging.info(f"[PreviewBridgeVideo] Found image in preview_bridge_image_id_map")
+                # Load the edited frame - capture both RGB and alpha
+                edited_rgb, edited_mask, path_item = PreviewBridgeVideo.load_image(image)
+                logging.info(f"[PreviewBridgeVideo] Loaded edited image, RGB shape: {edited_rgb.shape}, mask shape: {edited_mask.shape}, non-zero: {torch.sum(edited_mask > 0).item()}")
+                
+                # Try multiple methods to find the frame index
+                frame_idx = None
+                
+                # Method 1: Check if we have a stored "last_edited_frame_idx" from when user clicked on a frame
+                # This is set by the frontend when a specific frame is opened in mask editor
+                if 'last_edited_frame_idx' in node_cache:
+                    frame_idx = node_cache['last_edited_frame_idx']
+                    logging.info(f"[PreviewBridgeVideo] Found frame index from last_edited_frame_idx: {frame_idx}")
+                
+                # Method 2: Check if this image ID is in our frame map
+                if frame_idx is None and 'frame_map' in node_cache and image in node_cache['frame_map']:
+                    frame_idx = node_cache['frame_map'][image]
+                    logging.info(f"[PreviewBridgeVideo] Found frame index from frame_map: {frame_idx}")
+                
+                # Method 3: Parse from the original filename in preview bridge map
+                if frame_idx is None:
+                    image_path, _ = core.preview_bridge_image_id_map.get(image, (None, None))
+                    logging.info(f"[PreviewBridgeVideo] Trying to parse from path: {image_path}")
+                    if image_path:
+                        # Extract frame index from filename like "PBV-123-0042-..."
+                        match = re.search(r'PBV-[^-]+-(\d+)', image_path)
+                        if match:
+                            frame_idx = int(match.group(1))
+                            logging.info(f"[PreviewBridgeVideo] Parsed frame index from filename: {frame_idx}")
+                
+                # Update both RGB and mask for the identified frame
+                if frame_idx is not None and 0 <= frame_idx < batch_size:
+                    logging.info(f"[PreviewBridgeVideo] Batch size before update: {images.shape[0]}")
+                    
+                    # Ensure edited_rgb has correct shape and matches images device/dtype
+                    edited_rgb = edited_rgb.to(device=images.device, dtype=images.dtype)
+                    
+                    # Combine the RGB from mask editor with the original image dimensions
+                    if edited_rgb.shape[1:3] == images.shape[1:3]:
+                        # Direct replacement if dimensions match - use clone to ensure no shape issues
+                        images = torch.cat([
+                            images[:frame_idx],
+                            edited_rgb,
+                            images[frame_idx+1:]
+                        ], dim=0)
+                        logging.info(f"[PreviewBridgeVideo] ✓ Updated RGB for frame {frame_idx}")
+                    else:
+                        # Resize if needed (shouldn't normally happen, but safety check)
+                        logging.warning(f"[PreviewBridgeVideo] Size mismatch: edited {edited_rgb.shape} vs batch {images.shape}, resizing...")
+                        from PIL import Image
+                        edited_pil = Image.fromarray((edited_rgb.squeeze(0).cpu().numpy() * 255).astype(np.uint8))
+                        edited_pil_resized = edited_pil.resize((images.shape[2], images.shape[1]), Image.LANCZOS)
+                        edited_rgb_resized = torch.from_numpy(np.array(edited_pil_resized).astype(np.float32) / 255.0).unsqueeze(0).to(device=images.device, dtype=images.dtype)
+                        images = torch.cat([
+                            images[:frame_idx],
+                            edited_rgb_resized,
+                            images[frame_idx+1:]
+                        ], dim=0)
+                        logging.info(f"[PreviewBridgeVideo] ✓ Updated RGB for frame {frame_idx} (resized)")
+                    
+                    logging.info(f"[PreviewBridgeVideo] Batch size after update: {images.shape[0]}")
+                    
+                    # Verify batch size hasn't changed
+                    if images.shape[0] != batch_size:
+                        logging.error(f"[PreviewBridgeVideo] ERROR: Batch size changed from {batch_size} to {images.shape[0]}!")
+                        batch_size = images.shape[0]  # Update to prevent index errors
+                    
+                    masks[frame_idx] = edited_mask.squeeze(0)
+                    logging.info(f"[PreviewBridgeVideo] ✓ Updated mask for frame {frame_idx}")
+                else:
+                    logging.warning(f"[PreviewBridgeVideo] ✗ Could not identify frame index! frame_idx={frame_idx}")
+            else:
+                logging.warning(f"[PreviewBridgeVideo] Image not found in preview_bridge_image_id_map")
+
+        # Generate previews for ALL frames
+        image_list = []
+        frame_to_path_map = {}  # Track which frame index corresponds to which file
+        
+        # Clear old frame_map to avoid stale registrations
+        if 'frame_map' in node_cache:
+            logging.info(f"[PreviewBridgeVideo] Clearing old frame_map with {len(node_cache['frame_map'])} entries")
+            node_cache['frame_map'] = {}
+        
+        logging.info(f"[PreviewBridgeVideo] About to generate {batch_size} previews, images.shape={images.shape}")
+        
+        for idx in range(batch_size):
+            current_frame = images[idx:idx+1]
+            current_mask = masks[idx:idx+1]
+            
+            # Check if mask is empty
+            if torch.all(current_mask == 0):
+                # No mask - just show the image
+                res = nodes.PreviewImage().save_images(
+                    current_frame, 
+                    filename_prefix=f"PreviewBridge/PBV-{unique_id}-{idx:04d}-", 
+                    prompt=prompt, 
+                    extra_pnginfo=extra_pnginfo
+                )
+            else:
+                # Has mask - show image with mask overlay
+                masked_images = utils.tensor_convert_rgba(current_frame)
+                resized_mask = utils.resize_mask(current_mask, (current_frame.shape[1], current_frame.shape[2])).unsqueeze(3)
+                resized_mask = 1 - resized_mask
+                utils.tensor_putalpha(masked_images, resized_mask)
+                res = nodes.PreviewImage().save_images(
+                    masked_images, 
+                    filename_prefix=f"PreviewBridge/PBV-{unique_id}-{idx:04d}-", 
+                    prompt=prompt, 
+                    extra_pnginfo=extra_pnginfo
+                )
+            
+            frame_image_list = res['ui']['images']
+            image_list.extend(frame_image_list)
+            
+            # Store mapping for this frame
+            if frame_image_list:
+                img_path = os.path.join(folder_paths.get_temp_directory(), 'PreviewBridge', frame_image_list[0]['filename'])
+                frame_to_path_map[img_path] = idx
+                # Register each frame for preview bridge
+                pb_id = core.set_previewbridge_image(unique_id, img_path, frame_image_list[0])
+                # Store frame index in multiple formats for lookup when clipspace returns
+                if 'frame_map' not in node_cache:
+                    node_cache['frame_map'] = {}
+                # Store with pb_id as key
+                node_cache['frame_map'][pb_id] = idx
+                # Also store with the image path as key
+                node_cache['frame_map'][img_path] = idx
+                # And store index-to-pb_id reverse mapping
+                node_cache['frame_map'][f"idx_{idx}"] = pb_id
+                logging.info(f"[PreviewBridgeVideo] Registered frame {idx} with pb_id: {pb_id}")
+        
+        # Save masks to cache for restore_mask functionality
+        saved_count = 0
+        for idx in range(batch_size):
+            if not torch.all(masks[idx] == 0):
+                node_mask_cache[idx] = masks[idx:idx+1]
+                saved_count += 1
+                logging.info(f"[PreviewBridgeVideo] Saved mask for frame {idx} to cache")
+        logging.info(f"[PreviewBridgeVideo] Total masks saved to cache: {saved_count}/{batch_size}")
+        logging.info(f"[PreviewBridgeVideo] Final image_list length: {len(image_list)} (expected: {batch_size})")
+        logging.info(f"[PreviewBridgeVideo] Final images batch shape: {images.shape}")
+        logging.info(f"[PreviewBridgeVideo] Final masks batch shape: {masks.shape}")
+        logging.info(f"[PreviewBridgeVideo] === Execution End ===")
+        
+        # Check if all masks are empty for block functionality
+        all_masks_empty = torch.all(masks == 0)
+        
+        if block and all_masks_empty and core.is_execution_model_version_supported():
+            from comfy_execution.graph import ExecutionBlocker
+            result = ExecutionBlocker(None), ExecutionBlocker(None)
+        elif block and all_masks_empty:
+            logging.warning("[Impact Pack] PreviewBridgeVideo: ComfyUI is outdated - blocking feature is disabled.")
+            result = (images, masks)
+        else:
+            result = (images, masks)
+            
+        return {
+            "ui": {"images": image_list},
             "result": result,
         }

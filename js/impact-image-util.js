@@ -141,6 +141,139 @@ app.registerExtension({
 			});
 		}
 
+		if(node.comfyClass == "PreviewBridgeVideo") {
+			console.log("[PreviewBridgeVideo] Initializing frontend for node", node.id);
+			let w = node.widgets.find(obj => obj.name === 'image');
+			
+			// Store the original array to protect it during clipspace operations
+			let preservedImgs = null;
+			let editedFrameIndex = null;
+			let clipspaceImageCount = 0;
+			
+			// Handle clipspace return from mask editor
+			Object.defineProperty(node, 'imgs', {
+				set(v) {
+					const stackTrace = new Error().stack;
+					const isClipspace = stackTrace.includes('pasteFromClipspace');
+					console.log("[PreviewBridgeVideo] imgs setter called, length:", v ? v.length : 0, "isClipspace:", isClipspace);
+					console.log("[PreviewBridgeVideo] Current node._imgs length:", node._imgs ? node._imgs.length : 0);
+					
+					if(v && v.length == 0) {
+						console.log("[PreviewBridgeVideo] Ignoring empty array");
+						return;
+					}
+					
+					// When pasting from clipspace (mask editor), handle the edited frame
+					if(isClipspace && w) {
+						console.log("[PreviewBridgeVideo] Detected pasteFromClipspace!");
+						console.log("[PreviewBridgeVideo] Image source:", v[0].src);
+						
+						// Preserve the current imgs array on first clipspace call
+						if(!preservedImgs && node._imgs) {
+							preservedImgs = [...node._imgs];
+							clipspaceImageCount = 0;
+							console.log("[PreviewBridgeVideo] Preserved imgs array, length:", preservedImgs.length);
+							
+							// Try multiple ways to determine which frame is being edited
+							editedFrameIndex = null;
+							
+							// Try ComfyApp.clipspace.selectedIndex
+							if(ComfyApp?.clipspace?.selectedIndex !== undefined) {
+								editedFrameIndex = ComfyApp.clipspace.selectedIndex;
+								console.log("[PreviewBridgeVideo] Detected edited frame from ComfyApp.clipspace.selectedIndex:", editedFrameIndex);
+							}
+							// Try app.canvas.ds.clipspace
+							else if(app?.canvas?.ds?.clipspace?.selectedIndex !== undefined) {
+								editedFrameIndex = app.canvas.ds.clipspace.selectedIndex;
+								console.log("[PreviewBridgeVideo] Detected edited frame from app.canvas.ds.clipspace:", editedFrameIndex);
+							}
+							// As fallback, assume frame 0 (better than nothing)
+							else {
+								console.warn("[PreviewBridgeVideo] Could not detect edited frame index, will not update preview");
+								console.log("[PreviewBridgeVideo] Available: ComfyApp.clipspace=", ComfyApp?.clipspace);
+							}
+						}
+						
+						// IMPORTANT: Always restore the preserved array to block external modifications
+						// Even if we can't detect which frame was edited
+						if(preservedImgs) {
+							node._imgs = [...preservedImgs];
+							console.log("[PreviewBridgeVideo] Blocked external modification, restored to length:", node._imgs.length);
+						}
+						
+						clipspaceImageCount++;
+						console.log("[PreviewBridgeVideo] Clipspace image count:", clipspaceImageCount);
+						
+						let sp = new URLSearchParams(v[0].src.split("?")[1]);
+						let str = "";
+						if(sp.get('subfolder')) {
+							str += sp.get('subfolder') + '/';
+						}
+						str += `${sp.get("filename")} [${sp.get("type")}]`;
+						
+						console.log("[PreviewBridgeVideo] Setting widget value to:", str);
+						w.value = str;
+						
+						// On the second clipspace call (the painted-masked image), update the edited frame
+						if(clipspaceImageCount === 2 && editedFrameIndex !== null && editedFrameIndex >= 0 && editedFrameIndex < preservedImgs.length && v && v[0]) {
+							console.log("[PreviewBridgeVideo] Updating frame", editedFrameIndex, "with clipspace image");
+							preservedImgs[editedFrameIndex] = v[0];
+							// Restore with the updated frame
+							node._imgs = [...preservedImgs];
+							console.log("[PreviewBridgeVideo] Updated preview with edited frame", editedFrameIndex);
+						}
+						
+						// After both clipspace calls, reset
+						if(clipspaceImageCount >= 2) {
+							console.log("[PreviewBridgeVideo] Clipspace sequence complete, resetting state");
+							preservedImgs = null;
+							editedFrameIndex = null;
+							clipspaceImageCount = 0;
+						}
+						
+						console.log("[PreviewBridgeVideo] Clipspace handled - imgs array protected");
+						return; // Exit early
+					}
+					
+					// Normal update from backend execution - replace entire array
+					// The backend always sends ALL frames, so we replace everything
+					console.log("[PreviewBridgeVideo] Normal update - replacing entire imgs array");
+					node._imgs = v;
+					preservedImgs = null; // Clear preservation since we have new data
+					editedFrameIndex = null;
+					clipspaceImageCount = 0;
+					console.log("[PreviewBridgeVideo] node._imgs updated to length:", node._imgs.length);
+				},
+				get() {
+					if(!node._imgs) {
+						node._imgs = [];
+					}
+					return node._imgs;
+				}
+			});
+			
+			// Also log when the widget value changes
+			if(w) {
+				const originalValueSetter = Object.getOwnPropertyDescriptor(w, 'value')?.set;
+				Object.defineProperty(w, 'value', {
+					set(v) {
+						console.log("[PreviewBridgeVideo] Widget 'image' value being set to:", v);
+						if(originalValueSetter) {
+							originalValueSetter.call(w, v);
+						} else {
+							w._value = v;
+						}
+					},
+					get() {
+						return w._value;
+					}
+				});
+				console.log("[PreviewBridgeVideo] Widget value setter instrumented");
+			} else {
+				console.warn("[PreviewBridgeVideo] Could not find 'image' widget!");
+			}
+		}
+
 		if(node.comfyClass == "ImageReceiver") {
 			let path_widget = node.widgets.find(obj => obj.name === 'image');
 			let w = node.widgets.find(obj => obj.name === 'image_data');
