@@ -141,206 +141,217 @@ app.registerExtension({
 			});
 		}
 
-		if(node.comfyClass == "PreviewBridgeVideo") {
-			console.log("[PreviewBridgeVideo] Initializing frontend for node", node.id);
-			let w = node.widgets.find(obj => obj.name === 'image');
+	if(node.comfyClass == "PreviewBridgeVideo") {
+		console.log("[PreviewBridgeVideo] Initializing frontend for node", node.id);
+		
+		// Initialize clipspace_masks widget if it doesn't exist
+		let clipspaceMasksWidget = node.widgets.find(obj => obj.name === 'clipspace_masks');
+		if(!clipspaceMasksWidget) {
+			// Create hidden widget for clipspace_masks
+			// serialize: true so it gets sent to backend during execution
+			// But we'll clear it after backend processes it to avoid bloating localStorage
+			clipspaceMasksWidget = {
+				name: 'clipspace_masks',
+				type: 'clipspace_masks',
+				value: {},
+				options: { serialize: true }
+			};
+			node.widgets.push(clipspaceMasksWidget);
+			console.log("[PreviewBridgeVideo] Created clipspace_masks widget");
+		}
+		
+		// Initialize clipspace_masks value as object/dict - ensure it's always an object
+		if(!clipspaceMasksWidget.value || typeof clipspaceMasksWidget.value !== 'object' || Array.isArray(clipspaceMasksWidget.value)) {
+			clipspaceMasksWidget.value = {};
+			console.log("[PreviewBridgeVideo] Initialized clipspace_masks widget value to empty object");
+		}
+		
+		// Track which frame is being sent to clipspace when user opens mask editor
+		node._lastOpenedFrameIndex = null;
+		
+		// Wrap ComfyApp.open_maskeditor to capture the frame index when it's opened
+		// This is more reliable than getClipspaceData which may not be called
+		if(!node._maskeditorWrapped && ComfyApp.open_maskeditor) {
+			const originalOpenMaskEditor = ComfyApp.open_maskeditor;
+			ComfyApp.open_maskeditor = function() {
+				// Capture the index BEFORE calling original function
+				// because clipspace_return_node may be cleared during the call
+				if(ComfyApp.clipspace_return_node === node && ComfyApp?.clipspace?.selectedIndex !== undefined) {
+					node._lastOpenedFrameIndex = ComfyApp.clipspace.selectedIndex;
+					console.log("[PreviewBridgeVideo] Captured frame index BEFORE opening mask editor:", node._lastOpenedFrameIndex);
+					console.log("[PreviewBridgeVideo] combinedIndex:", ComfyApp.clipspace.combinedIndex);
+					console.log("[PreviewBridgeVideo] paintedIndex:", ComfyApp.clipspace.paintedIndex);
+					if(ComfyApp.clipspace.imgs) {
+						console.log("[PreviewBridgeVideo] All clipspace images:");
+						ComfyApp.clipspace.imgs.forEach((img, idx) => {
+							const filename = img.src.substring(img.src.lastIndexOf('/') + 1, img.src.indexOf('?'));
+							console.log(`  [${idx}]: ${filename} ${idx === ComfyApp.clipspace.selectedIndex ? '← SELECTED' : ''} ${idx === ComfyApp.clipspace.combinedIndex ? '← COMBINED' : ''}`);
+						});
+					}
+				}
+				return originalOpenMaskEditor.apply(this, arguments);
+			};
+			node._maskeditorWrapped = true;
+		}
 			
-			// Initialize clipspace_masks widget if it doesn't exist
-			let clipspaceMasksWidget = node.widgets.find(obj => obj.name === 'clipspace_masks');
-			if(!clipspaceMasksWidget) {
-				// Create hidden widget for clipspace_masks
-				// serialize: true so it gets sent to backend during execution
-				// But we'll clear it after backend processes it to avoid bloating localStorage
-				clipspaceMasksWidget = {
-					name: 'clipspace_masks',
-					type: 'clipspace_masks',
-					value: {},
-					options: { serialize: true }
-				};
-				node.widgets.push(clipspaceMasksWidget);
-				console.log("[PreviewBridgeVideo] Created clipspace_masks widget");
-			}
-			
-			// Initialize clipspace_masks value as object/dict - ensure it's always an object
-			if(!clipspaceMasksWidget.value || typeof clipspaceMasksWidget.value !== 'object' || Array.isArray(clipspaceMasksWidget.value)) {
+		// Hook into execution lifecycle to clear masks after they're sent to backend
+		const originalOnExecuted = node.onExecuted;
+		node.onExecuted = function(message) {
+			// Clear the widget value after execution to prevent localStorage bloat
+			// The backend has cached the masks in node_cache, so they'll be restored from there
+			if(clipspaceMasksWidget.value && Object.keys(clipspaceMasksWidget.value).length > 0) {
+				console.log("[PreviewBridgeVideo] Clearing clipspace_masks widget after execution (backend has cached them)");
 				clipspaceMasksWidget.value = {};
-				console.log("[PreviewBridgeVideo] Initialized clipspace_masks widget value to empty object");
 			}
 			
-			// Hook into execution lifecycle to clear masks after they're sent to backend
-			const originalOnExecuted = node.onExecuted;
-			node.onExecuted = function(message) {
-				// Clear the widget value after execution to prevent localStorage bloat
-				// The backend has cached the masks in node_cache, so they'll be restored from there
-				if(clipspaceMasksWidget.value && Object.keys(clipspaceMasksWidget.value).length > 0) {
-					console.log("[PreviewBridgeVideo] Clearing clipspace_masks widget after execution (backend has cached them)");
-					clipspaceMasksWidget.value = {};
+			if(originalOnExecuted) {
+				return originalOnExecuted.apply(this, arguments);
+			}
+		};
+		
+		// Store the original array to protect it during clipspace operations
+		let preservedImgs = null;
+		let editedFrameIndex = null;
+		let clipspaceImageCount = 0;
+		
+		// Handle clipspace return from mask editor
+		Object.defineProperty(node, 'imgs', {
+			set(v) {
+				const stackTrace = new Error().stack;
+				const isClipspace = stackTrace.includes('pasteFromClipspace');
+				console.log("[PreviewBridgeVideo] imgs setter called, length:", v ? v.length : 0, "isClipspace:", isClipspace);
+				console.log("[PreviewBridgeVideo] Current node._imgs length:", node._imgs ? node._imgs.length : 0);
+				
+				if(v && v.length == 0) {
+					console.log("[PreviewBridgeVideo] Ignoring empty array");
+					return;
 				}
 				
-				if(originalOnExecuted) {
-					return originalOnExecuted.apply(this, arguments);
-				}
-			};
-			
-			// Store the original array to protect it during clipspace operations
-			let preservedImgs = null;
-			let editedFrameIndex = null;
-			let clipspaceImageCount = 0;
-			
-			// Handle clipspace return from mask editor
-			Object.defineProperty(node, 'imgs', {
-				set(v) {
-					const stackTrace = new Error().stack;
-					const isClipspace = stackTrace.includes('pasteFromClipspace');
-					console.log("[PreviewBridgeVideo] imgs setter called, length:", v ? v.length : 0, "isClipspace:", isClipspace);
-					console.log("[PreviewBridgeVideo] Current node._imgs length:", node._imgs ? node._imgs.length : 0);
+				// When pasting from clipspace (mask editor), handle the edited frame
+				if(isClipspace) {
+					console.log("[PreviewBridgeVideo] Detected pasteFromClipspace!");
+					console.log("[PreviewBridgeVideo] Image source:", v[0].src);
 					
-					if(v && v.length == 0) {
-						console.log("[PreviewBridgeVideo] Ignoring empty array");
-						return;
-					}
-					
-					// When pasting from clipspace (mask editor), handle the edited frame
-					if(isClipspace && w) {
-						console.log("[PreviewBridgeVideo] Detected pasteFromClipspace!");
-						console.log("[PreviewBridgeVideo] Image source:", v[0].src);
-						
-						// Preserve the current imgs array on first clipspace call
-						if(!preservedImgs && node._imgs) {
-							preservedImgs = [...node._imgs];
-							clipspaceImageCount = 0;
-							console.log("[PreviewBridgeVideo] Preserved imgs array, length:", preservedImgs.length);
-							
-							// Try multiple ways to determine which frame is being edited
-							editedFrameIndex = null;
-							
-							// Try ComfyApp.clipspace.selectedIndex
-							if(ComfyApp?.clipspace?.selectedIndex !== undefined) {
-								editedFrameIndex = ComfyApp.clipspace.selectedIndex;
-								console.log("[PreviewBridgeVideo] Detected edited frame from ComfyApp.clipspace.selectedIndex:", editedFrameIndex);
-							}
-							// Try app.canvas.ds.clipspace
-							else if(app?.canvas?.ds?.clipspace?.selectedIndex !== undefined) {
-								editedFrameIndex = app.canvas.ds.clipspace.selectedIndex;
-								console.log("[PreviewBridgeVideo] Detected edited frame from app.canvas.ds.clipspace:", editedFrameIndex);
-							}
-							// As fallback, assume frame 0 (better than nothing)
-							else {
-								console.warn("[PreviewBridgeVideo] Could not detect edited frame index, will not update preview");
-								console.log("[PreviewBridgeVideo] Available: ComfyApp.clipspace=", ComfyApp?.clipspace);
-							}
-						}
-						
-						// IMPORTANT: Always restore the preserved array to block external modifications
-						// Even if we can't detect which frame was edited
-						if(preservedImgs) {
-							node._imgs = [...preservedImgs];
-							console.log("[PreviewBridgeVideo] Blocked external modification, restored to length:", node._imgs.length);
-						}
-						
-						clipspaceImageCount++;
-						console.log("[PreviewBridgeVideo] Clipspace image count:", clipspaceImageCount);
-						
-						let sp = new URLSearchParams(v[0].src.split("?")[1]);
-						let str = "";
-						if(sp.get('subfolder')) {
-							str += sp.get('subfolder') + '/';
-						}
-						str += `${sp.get("filename")} [${sp.get("type")}]`;
-						
-						console.log("[PreviewBridgeVideo] Setting widget value to:", str);
-						w.value = str;
-						
-						// On the second clipspace call (the painted-masked image), update the edited frame
-						// This is also where we store a reference to the clipspace file (not raw data!)
-						if(clipspaceImageCount === 2 && editedFrameIndex !== null && editedFrameIndex >= 0 && editedFrameIndex < preservedImgs.length && v && v[0]) {
-							console.log("[PreviewBridgeVideo] Updating frame", editedFrameIndex, "with clipspace image");
-							preservedImgs[editedFrameIndex] = v[0];
-							// Restore with the updated frame
-							node._imgs = [...preservedImgs];
-							console.log("[PreviewBridgeVideo] Updated preview with edited frame", editedFrameIndex);
-							
-							// Store a lightweight reference to the clipspace file instead of raw mask data
-							// This prevents memory bloat while still allowing the backend to load masks
-							try {
-								const frameIndex = editedFrameIndex;
-								
-								// Parse the clipspace filename from the URL
-								let sp = new URLSearchParams(v[0].src.split("?")[1]);
-								let clipspaceFile = "";
-								if(sp.get('subfolder')) {
-									clipspaceFile += sp.get('subfolder') + '/';
-								}
-								clipspaceFile += `${sp.get("filename")} [${sp.get("type")}]`;
-								
-								// Ensure clipspaceMasksWidget.value is an object
-								if(typeof clipspaceMasksWidget.value !== 'object' || clipspaceMasksWidget.value === null) {
-									clipspaceMasksWidget.value = {};
-								}
-								
-								// Store just the file reference - much smaller than raw data!
-								clipspaceMasksWidget.value[frameIndex] = clipspaceFile;
-								console.log("[PreviewBridgeVideo] Stored clipspace file reference for frame", frameIndex, ":", clipspaceFile);
-							} catch(e) {
-								console.error("[PreviewBridgeVideo] Failed to store clipspace reference:", e);
-							}
-						}
-						
-						// After both clipspace calls, reset
-						if(clipspaceImageCount >= 2) {
-							console.log("[PreviewBridgeVideo] Clipspace sequence complete, resetting state");
-							preservedImgs = null;
-							editedFrameIndex = null;
-							clipspaceImageCount = 0;
-						}
-						
-						console.log("[PreviewBridgeVideo] Clipspace handled - imgs array protected");
-						return; // Exit early
-					}
-					
-					// Normal update from backend execution - replace entire array
-					// The backend always sends ALL frames, so we replace everything
-					console.log("[PreviewBridgeVideo] Normal update - replacing entire imgs array");
-					node._imgs = v;
-					preservedImgs = null; // Clear preservation since we have new data
-					editedFrameIndex = null;
+				// Preserve the current imgs array on first clipspace call
+				if(!preservedImgs && node._imgs) {
+					preservedImgs = [...node._imgs];
 					clipspaceImageCount = 0;
+					console.log("[PreviewBridgeVideo] Preserved imgs array, length:", preservedImgs.length);
 					
-					// Note: We DON'T clear clipspace_masks here because the backend will
-					// restore them if needed based on restore_mask setting
-					// The backend manages clipspace_masks state
+					// Use the frame index that was captured when mask editor was opened
+					editedFrameIndex = node._lastOpenedFrameIndex;
+					console.log("[PreviewBridgeVideo] Using captured frame index:", editedFrameIndex);
+				}
 					
-					console.log("[PreviewBridgeVideo] node._imgs updated to length:", node._imgs.length);
-				},
-				get() {
-					if(!node._imgs) {
-						node._imgs = [];
+					// IMPORTANT: Always restore the preserved array to block external modifications
+					// Even if we can't detect which frame was edited
+					if(preservedImgs) {
+						node._imgs = [...preservedImgs];
+						console.log("[PreviewBridgeVideo] Blocked external modification, restored to length:", node._imgs.length);
 					}
-					return node._imgs;
+					
+					clipspaceImageCount++;
+					console.log("[PreviewBridgeVideo] Clipspace image count:", clipspaceImageCount);
+					
+					// Parse the clipspace filename from the URL
+					let sp = new URLSearchParams(v[0].src.split("?")[1]);
+					let clipspaceFile = "";
+					if(sp.get('subfolder')) {
+						clipspaceFile += sp.get('subfolder') + '/';
+					}
+					clipspaceFile += `${sp.get("filename")} [${sp.get("type")}]`;
+					console.log("[PreviewBridgeVideo] Clipspace file:", clipspaceFile);
+					
+					// On the second clipspace call (the painted-masked image), update the edited frame
+					// This is also where we store a reference to the clipspace file (not raw data!)
+					if(clipspaceImageCount === 2 && editedFrameIndex !== null && editedFrameIndex >= 0 && editedFrameIndex < preservedImgs.length && v && v[0]) {
+						console.log("[PreviewBridgeVideo] Updating frame", editedFrameIndex, "with clipspace image");
+						preservedImgs[editedFrameIndex] = v[0];
+						// Restore with the updated frame
+						node._imgs = [...preservedImgs];
+						console.log("[PreviewBridgeVideo] Updated preview with edited frame", editedFrameIndex);
+						
+						// Store a lightweight reference to the clipspace file instead of raw mask data
+						// This prevents memory bloat while still allowing the backend to load masks
+						try {
+							const frameIndex = editedFrameIndex;
+							
+							// Ensure clipspaceMasksWidget.value is an object
+							if(typeof clipspaceMasksWidget.value !== 'object' || clipspaceMasksWidget.value === null) {
+								clipspaceMasksWidget.value = {};
+							}
+							
+							// Store just the file reference WITH the frame index - much smaller than raw data!
+							clipspaceMasksWidget.value[frameIndex] = clipspaceFile;
+							console.log("[PreviewBridgeVideo] Stored clipspace file reference for frame", frameIndex, ":", clipspaceFile);
+						} catch(e) {
+							console.error("[PreviewBridgeVideo] Failed to store clipspace reference:", e);
+						}
+					}
+					
+					// After both clipspace calls, reset and trigger execution
+					if(clipspaceImageCount >= 2) {
+						console.log("[PreviewBridgeVideo] Clipspace sequence complete, resetting state");
+						preservedImgs = null;
+						editedFrameIndex = null;
+						clipspaceImageCount = 0;
+						
+						// Trigger workflow execution to update previews with masks
+						// This ensures the mask overlay is rendered properly
+						console.log("[PreviewBridgeVideo] Queuing workflow execution to render mask overlays");
+						try {
+							if(app && app.queuePrompt) {
+								// Queue with the current extra data
+								app.queuePrompt(0, -1);
+							}
+						} catch(e) {
+							console.error("[PreviewBridgeVideo] Failed to queue prompt:", e);
+						}
+					}
+					
+					console.log("[PreviewBridgeVideo] Clipspace handled - imgs array protected");
+					return; // Exit early
+				}
+				
+			// Normal update from backend execution - replace entire array
+			// The backend always sends ALL frames, so we replace everything
+			console.log("[PreviewBridgeVideo] Normal update - replacing entire imgs array");
+			console.log("[PreviewBridgeVideo] Received images:", v.length);
+			
+			// Log the filename of each image to verify order
+			v.forEach((img, idx) => {
+				if(img && img.src) {
+					let match = img.src.match(/PBV-\d+-(\d{4})/);
+					let frameIdx = match ? match[1] : 'unknown';
+					console.log(`[PreviewBridgeVideo] imgs[${idx}] -> frame ${frameIdx}: ${img.src.substring(img.src.lastIndexOf('/') + 1, img.src.lastIndexOf('?'))}`);
 				}
 			});
 			
-			// Also log when the widget value changes
-			if(w) {
-				const originalValueSetter = Object.getOwnPropertyDescriptor(w, 'value')?.set;
-				Object.defineProperty(w, 'value', {
-					set(v) {
-						console.log("[PreviewBridgeVideo] Widget 'image' value being set to:", v);
-						if(originalValueSetter) {
-							originalValueSetter.call(w, v);
-						} else {
-							w._value = v;
-						}
-					},
-					get() {
-						return w._value;
-					}
-				});
-				console.log("[PreviewBridgeVideo] Widget value setter instrumented");
-			} else {
-				console.warn("[PreviewBridgeVideo] Could not find 'image' widget!");
+			// Log clipspace_masks widget contents
+			if(clipspaceMasksWidget && clipspaceMasksWidget.value) {
+				console.log("[PreviewBridgeVideo] clipspace_masks widget contents:", JSON.stringify(clipspaceMasksWidget.value));
+				console.log("[PreviewBridgeVideo] clipspace_masks keys:", Object.keys(clipspaceMasksWidget.value));
 			}
-		}
+			
+			node._imgs = v;
+			preservedImgs = null; // Clear preservation since we have new data
+			editedFrameIndex = null;
+			clipspaceImageCount = 0;
+			
+			// Note: We DON'T clear clipspace_masks here because the backend will
+			// restore them if needed based on restore_mask setting
+			// The backend manages clipspace_masks state
+			
+			console.log("[PreviewBridgeVideo] node._imgs updated to length:", node._imgs.length);
+			},
+			get() {
+				if(!node._imgs) {
+					node._imgs = [];
+				}
+				return node._imgs;
+			}
+		});
+	}
 
 		if(node.comfyClass == "ImageReceiver") {
 			let path_widget = node.widgets.find(obj => obj.name === 'image');
