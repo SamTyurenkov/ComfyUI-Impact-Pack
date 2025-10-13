@@ -503,7 +503,7 @@ class PreviewBridgeVideo:
                     "block": ("BOOLEAN", {"default": False, "label_on": "if_empty_mask", "label_off": "never", "tooltip": "is_empty_mask: If all masks are empty, the execution is stopped.\nnever: The execution is never stopped."}),
                     "restore_mask": (["if_same_size", "always", "never"], {"tooltip": "if_same_size: If the input image is the same size as the previous image, restore the last saved masks (default)\nalways: Always restore the last saved masks, even when input images change\nnever: Do not restore masks - start fresh each time"}),
                     },
-                "hidden": {"unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO"},
+                "hidden": {"unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO", "clipspace_masks": "CLIPSPACE_MASKS"},
                 }
 
     RETURN_TYPES = ("IMAGE", "MASK", )
@@ -521,6 +521,56 @@ class PreviewBridgeVideo:
         self.output_dir = folder_paths.get_temp_directory()
         self.type = "temp"
         self.prev_hash = None
+
+    @staticmethod
+    def convert_clipspace_masks_to_tensors(clipspace_masks):
+        """Convert clipspace_masks from frontend format to torch tensors.
+        
+        Frontend format: {index: {width: int, height: int, data: [alpha values]}}
+        Backend format: {index: torch.Tensor}
+        """
+        if not clipspace_masks or not isinstance(clipspace_masks, dict):
+            return {}
+        
+        converted = {}
+        for idx_key, mask_data in clipspace_masks.items():
+            try:
+                # Skip null/None keys that may come from JavaScript
+                if idx_key is None or idx_key == 'null' or idx_key == 'undefined':
+                    logging.warning(f"[PreviewBridgeVideo] Skipping invalid clipspace mask key: {idx_key}")
+                    continue
+                
+                # Convert string keys to int
+                idx = int(idx_key) if isinstance(idx_key, str) else idx_key
+                
+                # If already a tensor, keep it
+                if torch.is_tensor(mask_data):
+                    converted[idx] = mask_data
+                    continue
+                
+                # Convert from frontend format
+                if isinstance(mask_data, dict) and 'width' in mask_data and 'height' in mask_data and 'data' in mask_data:
+                    width = mask_data['width']
+                    height = mask_data['height']
+                    data = mask_data['data']
+                    
+                    # Convert to numpy array, reshape, then to tensor
+                    # Alpha values are 0-255, normalize to 0-1
+                    # Invert: 255 (opaque) -> 0 (no mask), 0 (transparent) -> 1 (full mask)
+                    mask_array = np.array(data, dtype=np.float32)
+                    mask_array = (255.0 - mask_array) / 255.0
+                    mask_array = mask_array.reshape(height, width)
+                    
+                    # Convert to tensor and add batch dimension
+                    mask_tensor = torch.from_numpy(mask_array).unsqueeze(0)
+                    converted[idx] = mask_tensor
+                    logging.info(f"[PreviewBridgeVideo] Converted clipspace mask for frame {idx}: {width}x{height}")
+                else:
+                    logging.warning(f"[PreviewBridgeVideo] Invalid clipspace mask format for index {idx}: {type(mask_data)}")
+            except Exception as e:
+                logging.error(f"[PreviewBridgeVideo] Failed to convert clipspace mask for index {idx_key}: {e}")
+        
+        return converted
 
     @staticmethod
     def load_image(pb_id):
@@ -556,12 +606,13 @@ class PreviewBridgeVideo:
 
         return image, mask.unsqueeze(0), ui_item
 
-    def doit(self, images, image, unique_id, masks=None, block=False, restore_mask="if_same_size", prompt=None, extra_pnginfo=None):
+    def doit(self, images, image, unique_id, masks=None, block=False, restore_mask="if_same_size", prompt=None, extra_pnginfo=None, clipspace_masks=None):
         batch_size = images.shape[0]
         
         logging.info(f"[PreviewBridgeVideo] === Execution Start ===")
         logging.info(f"[PreviewBridgeVideo] unique_id={unique_id}, batch_size={batch_size}, restore_mask={restore_mask}")
         logging.info(f"[PreviewBridgeVideo] image param='{image[:50] if image else 'None'}...'")
+        logging.info(f"[PreviewBridgeVideo] clipspace_masks type: {type(clipspace_masks)}, value: {clipspace_masks if not isinstance(clipspace_masks, (list, dict)) else f'container with {len(clipspace_masks)} items'}")
         
         # Use a special cache key structure to avoid conflicts with regular PreviewBridge
         video_cache_key = f"{unique_id}_video"
@@ -569,26 +620,39 @@ class PreviewBridgeVideo:
         if video_cache_key not in core.preview_bridge_cache:
             core.preview_bridge_cache[video_cache_key] = {}
             logging.info(f"[PreviewBridgeVideo] Created new preview cache")
-        if video_cache_key not in core.preview_bridge_last_mask_cache:
-            core.preview_bridge_last_mask_cache[video_cache_key] = {}
-            logging.info(f"[PreviewBridgeVideo] Created new mask cache")
 
         node_cache = core.preview_bridge_cache[video_cache_key]
-        node_mask_cache = core.preview_bridge_last_mask_cache[video_cache_key]
         
-        logging.info(f"[PreviewBridgeVideo] Cached masks count: {len(node_mask_cache)}")
-        logging.info(f"[PreviewBridgeVideo] Cached mask frames: {list(node_mask_cache.keys())}")
+        # Initialize clipspace_masks array if not provided or if it's not a proper container
+        if clipspace_masks is None or not isinstance(clipspace_masks, (list, dict)):
+            # Try to restore from node_cache as fallback
+            if 'clipspace_masks' in node_cache:
+                clipspace_masks = node_cache['clipspace_masks']
+                logging.info(f"[PreviewBridgeVideo] Restored clipspace_masks from node_cache")
+            else:
+                clipspace_masks = {}
+                logging.info(f"[PreviewBridgeVideo] Initialized empty clipspace_masks")
+        elif isinstance(clipspace_masks, list):
+            # Convert list to dict for easier index access
+            clipspace_masks = {i: mask for i, mask in enumerate(clipspace_masks) if mask is not None}
+            logging.info(f"[PreviewBridgeVideo] Converted clipspace_masks list to dict")
+        
+        # Convert clipspace_masks from frontend format (if needed) to torch tensors
+        clipspace_masks = PreviewBridgeVideo.convert_clipspace_masks_to_tensors(clipspace_masks)
+        
+        logging.info(f"[PreviewBridgeVideo] Clipspace masks count: {len(clipspace_masks)}")
+        logging.info(f"[PreviewBridgeVideo] Clipspace mask frames: {list(clipspace_masks.keys())}")
         
         # Check if images have changed
         images_changed = False
         if 'images_ref' not in node_cache or node_cache['images_ref'] is not images:
             images_changed = True
             node_cache['images_ref'] = images
-            logging.info(f"[PreviewBridgeVideo] Images CHANGED - clearing cache if restore_mask='never'")
-            # Clear mask cache if images changed and restore_mask is "never"
+            logging.info(f"[PreviewBridgeVideo] Images CHANGED - clearing clipspace_masks if restore_mask='never'")
+            # Clear clipspace_masks if images changed and restore_mask is "never"
             if restore_mask == "never":
-                node_mask_cache.clear()
-                logging.info(f"[PreviewBridgeVideo] Cleared mask cache (restore_mask='never')")
+                clipspace_masks.clear()
+                logging.info(f"[PreviewBridgeVideo] Cleared clipspace_masks (restore_mask='never')")
         else:
             logging.info(f"[PreviewBridgeVideo] Images UNCHANGED")
         
@@ -605,7 +669,7 @@ class PreviewBridgeVideo:
                 new_masks[:copy_size] = masks[:copy_size]
                 masks = new_masks
         
-        # Restore masks from cache if needed
+        # Restore masks from clipspace_masks if needed
         # Restore masks if: restore_mask is "always", OR restore_mask is not "never" and images haven't changed
         should_restore = (restore_mask == "always") or (restore_mask != "never" and not images_changed)
         
@@ -614,13 +678,13 @@ class PreviewBridgeVideo:
         if should_restore:
             restored_count = 0
             for idx in range(batch_size):
-                if idx in node_mask_cache:
-                    cached_mask = node_mask_cache[idx]
-                    logging.info(f"[PreviewBridgeVideo] Found cached mask for frame {idx}, shape: {cached_mask.shape}")
+                if idx in clipspace_masks:
+                    cached_mask = clipspace_masks[idx]
+                    logging.info(f"[PreviewBridgeVideo] Found clipspace mask for frame {idx}, shape: {cached_mask.shape}")
                     # Check size compatibility for "if_same_size"
                     if restore_mask == "if_same_size" and images_changed:
                         if cached_mask.shape[1:] == masks.shape[1:3]:
-                            masks[idx] = cached_mask.squeeze(0)
+                            masks[idx] = cached_mask.squeeze(0) if len(cached_mask.shape) > 2 else cached_mask
                             restored_count += 1
                             logging.info(f"[PreviewBridgeVideo] Restored mask for frame {idx} (if_same_size with image change)")
                         else:
@@ -628,7 +692,7 @@ class PreviewBridgeVideo:
                     else:
                         # For "always" or when images haven't changed, restore regardless
                         if cached_mask.shape[1:] == masks.shape[1:3]:
-                            masks[idx] = cached_mask.squeeze(0)
+                            masks[idx] = cached_mask.squeeze(0) if len(cached_mask.shape) > 2 else cached_mask
                             restored_count += 1
                             logging.info(f"[PreviewBridgeVideo] Restored mask for frame {idx}")
                         else:
@@ -781,14 +845,22 @@ class PreviewBridgeVideo:
                 node_cache['frame_map'][f"idx_{idx}"] = pb_id
                 logging.info(f"[PreviewBridgeVideo] Registered frame {idx} with pb_id: {pb_id}")
         
-        # Save masks to cache for restore_mask functionality
+        # Save masks to clipspace_masks for restore_mask functionality
         saved_count = 0
         for idx in range(batch_size):
             if not torch.all(masks[idx] == 0):
-                node_mask_cache[idx] = masks[idx:idx+1]
+                clipspace_masks[idx] = masks[idx:idx+1]
                 saved_count += 1
-                logging.info(f"[PreviewBridgeVideo] Saved mask for frame {idx} to cache")
-        logging.info(f"[PreviewBridgeVideo] Total masks saved to cache: {saved_count}/{batch_size}")
+                logging.info(f"[PreviewBridgeVideo] Saved mask for frame {idx} to clipspace_masks")
+            elif idx in clipspace_masks:
+                # Remove empty masks from clipspace_masks
+                del clipspace_masks[idx]
+        logging.info(f"[PreviewBridgeVideo] Total masks saved to clipspace_masks: {saved_count}/{batch_size}")
+        
+        # Store clipspace_masks in node_cache for persistence across executions
+        node_cache['clipspace_masks'] = clipspace_masks
+        logging.info(f"[PreviewBridgeVideo] Stored clipspace_masks in node_cache")
+        
         logging.info(f"[PreviewBridgeVideo] Final image_list length: {len(image_list)} (expected: {batch_size})")
         logging.info(f"[PreviewBridgeVideo] Final images batch shape: {images.shape}")
         logging.info(f"[PreviewBridgeVideo] Final masks batch shape: {masks.shape}")
