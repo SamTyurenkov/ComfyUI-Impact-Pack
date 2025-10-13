@@ -188,6 +188,74 @@ app.registerExtension({
 							console.log(`  [${idx}]: ${filename} ${idx === ComfyApp.clipspace.selectedIndex ? '← SELECTED' : ''} ${idx === ComfyApp.clipspace.combinedIndex ? '← COMBINED' : ''}`);
 						});
 					}
+
+					// Align the combined image to the selected frame to avoid cross-frame leakage in mask editor
+					try {
+						const frameIdx = node._lastOpenedFrameIndex;
+						const widget = node.widgets.find(obj => obj.name === 'clipspace_masks');
+						const mapping = widget && widget.value && typeof widget.value === 'object' ? widget.value : null;
+						const refStr = mapping && (mapping[frameIdx] || mapping[String(frameIdx)]) ? (mapping[frameIdx] || mapping[String(frameIdx)]) : null;
+						const imgs = ComfyApp?.clipspace?.imgs;
+						const selectedIdx = ComfyApp?.clipspace?.selectedIndex;
+						const combinedIdx = ComfyApp?.clipspace?.combinedIndex;
+
+						if(imgs && typeof selectedIdx === 'number') {
+							if(refStr) {
+								// refStr format: "subfolder/filename [type]" or "filename [type]"
+								const typeMatch = /\[(.*?)\]\s*$/.exec(refStr);
+								const type = typeMatch ? typeMatch[1] : 'input';
+								const pathPart = refStr.replace(/\s*\[.*\]\s*$/, '');
+								let subfolder = '';
+								let filename = pathPart;
+								if(pathPart.includes('/')) {
+									const parts = pathPart.split('/');
+									subfolder = parts.slice(0, -1).join('/');
+									filename = parts[parts.length - 1];
+								}
+
+								const baseUrl = new URL(imgs[selectedIdx].src);
+								baseUrl.searchParams.set('filename', filename);
+								if(subfolder) baseUrl.searchParams.set('subfolder', subfolder); else baseUrl.searchParams.delete('subfolder');
+								baseUrl.searchParams.set('type', type);
+								baseUrl.searchParams.delete('channel');
+
+								const newImg = new Image();
+								newImg.crossOrigin = 'anonymous';
+								newImg.src = baseUrl.toString();
+
+								if(typeof combinedIdx === 'number' && imgs[combinedIdx] !== undefined) {
+									imgs[combinedIdx] = newImg;
+									if(ComfyApp.clipspace.images) {
+										ComfyApp.clipspace.images[combinedIdx] = { filename, subfolder, type };
+									}
+									console.log('[PreviewBridgeVideo] Set combined image for frame', frameIdx, '->', filename);
+								} else {
+									ComfyApp.clipspace.combinedIndex = undefined;
+									console.log('[PreviewBridgeVideo] No combined slot; cleared combinedIndex');
+								}
+								} else {
+									// No stored mask for this frame; keep combined slot but mirror base image
+									if(typeof combinedIdx === 'number' && imgs[combinedIdx] !== undefined) {
+										const mirror = new Image();
+										mirror.crossOrigin = 'anonymous';
+										mirror.src = imgs[selectedIdx].src;
+										imgs[combinedIdx] = mirror;
+										if(ComfyApp.clipspace.images) {
+											// best-effort mirror of metadata if present
+											const selUrl = new URL(imgs[selectedIdx].src);
+											ComfyApp.clipspace.images[combinedIdx] = {
+												filename: selUrl.searchParams.get('filename') || '',
+												subfolder: selUrl.searchParams.get('subfolder') || '',
+												type: selUrl.searchParams.get('type') || 'input'
+											};
+										}
+										console.log('[PreviewBridgeVideo] Mirrored base image into combined slot for frame', frameIdx);
+									}
+								}
+						}
+					} catch(e) {
+						console.warn('[PreviewBridgeVideo] Failed to align combined image for selected frame:', e);
+					}
 				}
 				return originalOpenMaskEditor.apply(this, arguments);
 			};
