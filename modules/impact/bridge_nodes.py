@@ -522,10 +522,12 @@ class PreviewBridgeVideo:
 
     @staticmethod
     def convert_clipspace_masks_to_tensors(clipspace_masks, unique_id):
-        """Convert clipspace_masks from frontend format to torch tensors with RGB and mask data.
+        """Convert clipspace_masks from frontend format to torch tensors with mask data.
         
         Frontend format: {frame_index: "clipspace/filename.png [input]"} - file reference with frame index as key
-        Backend format: {frame_index: {'rgb': torch.Tensor, 'mask': torch.Tensor}}
+        Backend format: {frame_index: {'mask': torch.Tensor}}
+        
+        Note: We only store masks, not RGB. RGB always comes from the fresh input images parameter.
         """
         if not clipspace_masks or not isinstance(clipspace_masks, dict):
             return {}
@@ -536,22 +538,21 @@ class PreviewBridgeVideo:
                 # Convert string keys to int
                 idx = int(idx_key) if isinstance(idx_key, str) else idx_key
                 
-                # If already a dict with rgb and mask tensors, keep it (from node_cache)
-                if isinstance(clipspace_file, dict) and 'rgb' in clipspace_file and 'mask' in clipspace_file:
+                # If already a dict with mask tensor, keep it (from node_cache)
+                if isinstance(clipspace_file, dict) and 'mask' in clipspace_file:
                     converted[idx] = clipspace_file
                     continue
                 
-                # Handle file reference (string path) - load BOTH RGB and mask
+                # Handle file reference (string path) - load mask only
                 if isinstance(clipspace_file, str):
-                    # Register the clipspace file and load both RGB and mask from it
+                    # Register the clipspace file and load mask from it
                     if PreviewBridge.register_clipspace_image(clipspace_file, unique_id):
                         if clipspace_file in core.preview_bridge_image_id_map:
-                            loaded_rgb, loaded_mask, _ = PreviewBridgeVideo.load_image(clipspace_file)
+                            _, loaded_mask, _ = PreviewBridgeVideo.load_image(clipspace_file)
                             converted[idx] = {
-                                'rgb': loaded_rgb,
                                 'mask': loaded_mask
                             }
-                            logging.info(f"[PreviewBridgeVideo] Loaded clipspace RGB+mask for frame {idx} from: {clipspace_file}")
+                            logging.info(f"[PreviewBridgeVideo] Loaded clipspace mask for frame {idx} from: {clipspace_file}")
                         else:
                             logging.warning(f"[PreviewBridgeVideo] Failed to load clipspace file for frame {idx}: {clipspace_file}")
                 else:
@@ -699,7 +700,6 @@ class PreviewBridgeVideo:
                     continue
                 
                 cached_mask = cached_data.get('mask')
-                cached_rgb = cached_data.get('rgb')
                 
                 if cached_mask is None:
                     logging.warning(f"[PreviewBridgeVideo] Frame {idx} has no mask data, skipping")
@@ -707,24 +707,17 @@ class PreviewBridgeVideo:
                 
                 # Check size compatibility
                 mask_matches = cached_mask.shape[1:] == masks.shape[1:3]
-                rgb_matches = cached_rgb is not None and cached_rgb.shape[1:3] == images.shape[1:3]
                 
-                # Restore mask (with size check for safety)
+                # Restore mask ONLY (never restore RGB - always use fresh input images)
                 if mask_matches:
                     masks[idx] = cached_mask.squeeze(0) if len(cached_mask.shape) > 2 else cached_mask
                     restored_count += 1
+                    logging.info(f"[PreviewBridgeVideo] Restored mask for frame {idx}")
                 else:
                     logging.warning(f"[PreviewBridgeVideo] Frame {idx} mask size mismatch, skipping restoration")
                     continue
-                
-                # Restore RGB (with size check for safety)
-                if rgb_matches:
-                    images[idx] = cached_rgb.squeeze(0) if len(cached_rgb.shape) > 3 else cached_rgb
-                    logging.info(f"[PreviewBridgeVideo] Restored RGB+mask for frame {idx}")
-                else:
-                    logging.info(f"[PreviewBridgeVideo] Restored mask only for frame {idx} (RGB size mismatch or missing)")
             
-            logging.info(f"[PreviewBridgeVideo] Restored {restored_count} frames")
+            logging.info(f"[PreviewBridgeVideo] Restored {restored_count} mask(s)")
 
         # No need to check for fresh run anymore - we rely entirely on clipspace_masks
         # which already contains the frame indices as keys
@@ -764,13 +757,13 @@ class PreviewBridgeVideo:
             image_list.extend(frame_image_list)
             logging.info(f"[PreviewBridgeVideo] Added frame {idx}: {frame_image_list[0]['filename']}, image_list now has {len(image_list)} items")
             
-        # Save both RGB and masks to clipspace_masks for frames that have masks
+        # Save masks to clipspace_masks for frames that have masks
+        # Note: We only save masks, not RGB. RGB always comes from fresh input images.
         saved_count = 0
         for idx in range(batch_size):
             if not torch.all(masks[idx] == 0):
-                # Store both RGB and mask for edited frames
+                # Store only mask for edited frames (RGB always uses fresh input)
                 clipspace_masks[idx] = {
-                    'rgb': images[idx:idx+1].clone(),
                     'mask': masks[idx:idx+1].clone()
                 }
                 saved_count += 1
