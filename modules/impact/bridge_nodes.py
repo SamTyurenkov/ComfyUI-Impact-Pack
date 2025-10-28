@@ -596,6 +596,26 @@ class PreviewBridgeVideo:
 
         return image, mask.unsqueeze(0), ui_item
 
+    @staticmethod
+    def extract_alpha_from_images(images):
+        """Extract alpha channel from input images and convert to mask format.
+        
+        Args:
+            images: torch.Tensor of shape (batch, height, width, channels) where channels=4 for RGBA
+            
+        Returns:
+            torch.Tensor: Alpha channel as mask with shape (batch, height, width)
+        """
+        if images.shape[-1] != 4:
+            # No alpha channel, return empty masks
+            return torch.zeros((images.shape[0], images.shape[1], images.shape[2]), dtype=torch.float32, device="cpu")
+        
+        # Extract alpha channel (last channel) and invert it to create mask
+        alpha = images[:, :, :, 3]  # Extract alpha channel
+        mask = 1.0 - alpha  # Invert alpha to create mask (0 = transparent, 1 = opaque)
+        
+        return mask
+
     def doit(self, images, unique_id, block=False, restore_mask="if_same_size", prompt=None, extra_pnginfo=None, clipspace_masks=None):
         batch_size = images.shape[0]
         
@@ -718,6 +738,12 @@ class PreviewBridgeVideo:
                     continue
             
             logging.info(f"[PreviewBridgeVideo] Restored {restored_count} mask(s)")
+        
+        # After restore/reset logic, check if we should use alpha channel for any empty masks
+        if images.shape[-1] == 4 and torch.all(masks == 0):
+            logging.info(f"[PreviewBridgeVideo] No masks present, extracting alpha channel from input images")
+            masks = PreviewBridgeVideo.extract_alpha_from_images(images)
+            logging.info(f"[PreviewBridgeVideo] Extracted alpha channel masks with shape: {masks.shape}")
 
         # No need to check for fresh run anymore - we rely entirely on clipspace_masks
         # which already contains the frame indices as keys
