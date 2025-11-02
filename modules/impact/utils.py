@@ -54,7 +54,7 @@ def tensor_convert_rgb(image, prefer_copy=True):
     if n_channel == 4:
         image = image[..., :3]
         if prefer_copy:
-            image = image.copy()
+            image = image.clone()
         return image
 
     if n_channel == 1:

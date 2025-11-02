@@ -172,7 +172,7 @@ class PreviewBridge:
                 mask = None
 
             if mask is None:
-                mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+                mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu").unsqueeze(0)
                 res = nodes.PreviewImage().save_images(images, filename_prefix="PreviewBridge/PB-", prompt=prompt, extra_pnginfo=extra_pnginfo)
             else:
                 masked_images = utils.tensor_convert_rgba(images)
@@ -194,14 +194,7 @@ class PreviewBridge:
 
         is_empty_mask = torch.all(mask == 0)
 
-        if block and is_empty_mask and core.is_execution_model_version_supported():
-            from comfy_execution.graph import ExecutionBlocker
-            result = ExecutionBlocker(None), ExecutionBlocker(None)
-        elif block and is_empty_mask:
-            logging.warning("[Impact Pack] PreviewBridge: ComfyUI is outdated - blocking feature is disabled.")
-            result = pixels, mask
-        else:
-            result = pixels, mask
+        result = pixels, mask
 
         if not is_empty_mask:
             core.preview_bridge_last_mask_cache[unique_id] = mask
@@ -623,6 +616,25 @@ class PreviewBridgeVideo:
         logging.info(f"[PreviewBridgeVideo] unique_id={unique_id}, batch_size={batch_size}, restore_mask={restore_mask}")
         logging.info(f"[PreviewBridgeVideo] clipspace_masks: {clipspace_masks if not isinstance(clipspace_masks, dict) or len(clipspace_masks) < 3 else f'dict with {len(clipspace_masks)} frames'}")
         
+        # Clean up old preview files for this node to avoid accumulation
+        try:
+            preview_dir = os.path.join(folder_paths.get_temp_directory(), 'PreviewBridge')
+            if os.path.exists(preview_dir):
+                pattern = f"PBV-{unique_id}-"
+                removed_count = 0
+                for filename in os.listdir(preview_dir):
+                    if filename.startswith(pattern):
+                        file_path = os.path.join(preview_dir, filename)
+                        try:
+                            os.remove(file_path)
+                            removed_count += 1
+                        except Exception as e:
+                            logging.warning(f"[PreviewBridgeVideo] Failed to remove old file {filename}: {e}")
+                if removed_count > 0:
+                    logging.info(f"[PreviewBridgeVideo] Cleaned up {removed_count} old preview files")
+        except Exception as e:
+            logging.warning(f"[PreviewBridgeVideo] Failed to clean up old preview files: {e}")
+        
         # Use unique_id directly as cache key so it won't be garbage collected
         # Store video-specific data in a nested structure to avoid conflicts with other PreviewBridge types
         if unique_id not in core.preview_bridge_cache:
@@ -642,8 +654,12 @@ class PreviewBridgeVideo:
         # First, load existing masks from cache
         existing_masks = {}
         if 'clipspace_masks' in video_cache:
-            existing_masks = video_cache['clipspace_masks'].copy()
-            logging.info(f"[PreviewBridgeVideo] Loaded existing masks from video_cache: {len(existing_masks)} frames")
+            cached_masks = video_cache['clipspace_masks']
+            if isinstance(cached_masks, dict):
+                existing_masks = cached_masks.copy()
+                logging.info(f"[PreviewBridgeVideo] Loaded existing masks from video_cache: {len(existing_masks)} frames")
+            else:
+                logging.warning(f"[PreviewBridgeVideo] clipspace_masks in cache is not a dict, got {type(cached_masks)}, resetting")
         
         # Then, handle new edits from frontend
         new_edits = {}
@@ -658,48 +674,82 @@ class PreviewBridgeVideo:
             new_edits = PreviewBridgeVideo.convert_clipspace_masks_to_tensors(clipspace_masks, unique_id)
             logging.info(f"[PreviewBridgeVideo] Converted {len(new_edits)} new edits from frontend")
         
-        # Merge: start with existing masks, then overlay new edits
-        clipspace_masks = existing_masks
-        for frame_idx, edit_data in new_edits.items():
-            clipspace_masks[frame_idx] = edit_data
-            logging.info(f"[PreviewBridgeVideo] Merged edit for frame {frame_idx}")
-        
-        logging.info(f"[PreviewBridgeVideo] Final merged clipspace_masks: {len(clipspace_masks)} frames ({list(clipspace_masks.keys())})")
-        
         # Check if images have changed (including batch size and dimensions)
+        # This must be done BEFORE merging to properly handle if_same_size
         images_changed = False
         prev_batch_size = video_cache.get('batch_size', None)
         prev_height = video_cache.get('height', None)
         prev_width = video_cache.get('width', None)
+        prev_channels = video_cache.get('channels', None)
+        prev_transparent_pixels = video_cache.get('transparent_pixels', None)
         
         current_batch_size = images.shape[0]
         current_height = images.shape[1]
         current_width = images.shape[2]
+        current_channels = images.shape[3] if len(images.shape) > 3 else 3
+        # Count transparent pixels in first image only
+        current_transparent_pixels = 0
+        if current_channels == 4:
+            # Has alpha channel - count transparent pixels in first image
+            first_image_alpha = images[0, :, :, 3]
+            current_transparent_pixels = int(torch.sum(first_image_alpha < 1.0).item())
         
+        logging.info(f"[PreviewBridgeVideo] Image info: channels={current_channels}, transparent_pixels={current_transparent_pixels}")
+        
+        size_changed = False
         if ('images_ref' not in video_cache or video_cache['images_ref'] is not images or
             prev_batch_size != current_batch_size or 
             prev_height != current_height or 
-            prev_width != current_width):
+            prev_width != current_width or
+            prev_channels != current_channels or
+            prev_transparent_pixels != current_transparent_pixels):
             images_changed = True
             video_cache['images_ref'] = images
             video_cache['batch_size'] = current_batch_size
             video_cache['height'] = current_height
             video_cache['width'] = current_width
-            logging.info(f"[PreviewBridgeVideo] Images CHANGED (batch: {prev_batch_size}->{current_batch_size}, size: {prev_height}x{prev_width}->{current_height}x{current_width})")
-            # Clear clipspace_masks if images changed and restore_mask is "never"
-            if restore_mask == "never":
-                clipspace_masks.clear()
-                logging.info(f"[PreviewBridgeVideo] Cleared clipspace_masks (restore_mask='never')")
-            # For "if_same_size", clear masks if dimensions changed
-            elif restore_mask == "if_same_size":
-                if (prev_batch_size is not None and 
-                    (prev_batch_size != current_batch_size or 
-                     prev_height != current_height or 
-                     prev_width != current_width)):
-                    clipspace_masks.clear()
-                    logging.info(f"[PreviewBridgeVideo] Cleared clipspace_masks due to size change (restore_mask='if_same_size')")
+            video_cache['channels'] = current_channels
+            video_cache['transparent_pixels'] = current_transparent_pixels
+            
+            # Check if this is a size/dimension change (not just first run)
+            if (prev_batch_size is not None and 
+                (prev_batch_size != current_batch_size or 
+                 prev_height != current_height or 
+                 prev_width != current_width or
+                 prev_channels != current_channels or
+                 prev_transparent_pixels != current_transparent_pixels)):
+                size_changed = True
+            
+            logging.info(f"[PreviewBridgeVideo] Images CHANGED (batch: {prev_batch_size}->{current_batch_size}, size: {prev_height}x{prev_width}->{current_height}x{current_width}, channels: {prev_channels}->{current_channels}, transparent_px: {prev_transparent_pixels}->{current_transparent_pixels}, size_changed={size_changed})")
         else:
             logging.info(f"[PreviewBridgeVideo] Images UNCHANGED")
+        
+        # Determine which masks to use based on restore_mask setting
+        if restore_mask == "never":
+            # Never restore any masks
+            clipspace_masks = {}
+            logging.info(f"[PreviewBridgeVideo] Cleared all masks (restore_mask='never')")
+        elif restore_mask == "if_same_size":
+            if size_changed:
+                # Size changed - discard both existing_masks and new_edits
+                clipspace_masks = {}
+                logging.info(f"[PreviewBridgeVideo] Cleared all masks due to size change (restore_mask='if_same_size')")
+            else:
+                # Size unchanged - merge existing_masks with new_edits
+                clipspace_masks = existing_masks
+                for frame_idx, edit_data in new_edits.items():
+                    clipspace_masks[frame_idx] = edit_data
+                    logging.info(f"[PreviewBridgeVideo] Merged edit for frame {frame_idx}")
+                logging.info(f"[PreviewBridgeVideo] Preserved masks (size unchanged, restore_mask='if_same_size')")
+        else:  # restore_mask == "always"
+            # Always restore - merge existing_masks with new_edits regardless of size change
+            clipspace_masks = existing_masks
+            for frame_idx, edit_data in new_edits.items():
+                clipspace_masks[frame_idx] = edit_data
+                logging.info(f"[PreviewBridgeVideo] Merged edit for frame {frame_idx}")
+            logging.info(f"[PreviewBridgeVideo] Preserved masks (restore_mask='always')")
+        
+        logging.info(f"[PreviewBridgeVideo] Final merged clipspace_masks: {len(clipspace_masks)} frames ({list(clipspace_masks.keys())})")
         
         # Initialize masks - always start with zeros
         masks = torch.zeros((batch_size, images.shape[1], images.shape[2]), dtype=torch.float32, device="cpu")
@@ -739,11 +789,15 @@ class PreviewBridgeVideo:
             
             logging.info(f"[PreviewBridgeVideo] Restored {restored_count} mask(s)")
         
-        # After restore/reset logic, check if we should use alpha channel for any empty masks
-        if images.shape[-1] == 4 and torch.all(masks == 0):
-            logging.info(f"[PreviewBridgeVideo] No masks present, extracting alpha channel from input images")
-            masks = PreviewBridgeVideo.extract_alpha_from_images(images)
-            logging.info(f"[PreviewBridgeVideo] Extracted alpha channel masks with shape: {masks.shape}")
+        # Extract alpha channel only for frames that have never been edited
+        # If clipspace_masks has entries, those frames were edited (even if cleared)
+        if images.shape[-1] == 4:
+            for idx in range(batch_size):
+                if torch.all(masks[idx] == 0) and idx not in clipspace_masks:
+                    # Frame has no mask and was never edited - extract from alpha channel
+                    alpha_mask = PreviewBridgeVideo.extract_alpha_from_images(images[idx:idx+1])
+                    masks[idx] = alpha_mask.squeeze(0)
+                    logging.info(f"[PreviewBridgeVideo] Extracted alpha channel for unedited frame {idx}")
 
         # No need to check for fresh run anymore - we rely entirely on clipspace_masks
         # which already contains the frame indices as keys
@@ -759,9 +813,11 @@ class PreviewBridgeVideo:
             
             # Check if mask is empty
             if torch.all(current_mask == 0):
-                # No mask - just show the image
+                # No mask - show image as RGB (strip alpha if present)
+                # This prevents the alpha channel from appearing in mask editor when mask is cleared
+                preview_frame = utils.tensor_convert_rgb(current_frame)
                 res = nodes.PreviewImage().save_images(
-                    current_frame, 
+                    preview_frame, 
                     filename_prefix=f"PreviewBridge/PBV-{unique_id}-{idx:04d}-", 
                     prompt=prompt, 
                     extra_pnginfo=extra_pnginfo
@@ -783,19 +839,28 @@ class PreviewBridgeVideo:
             image_list.extend(frame_image_list)
             logging.info(f"[PreviewBridgeVideo] Added frame {idx}: {frame_image_list[0]['filename']}, image_list now has {len(image_list)} items")
             
-        # Save masks to clipspace_masks for frames that have masks
+        # Save masks to clipspace_masks for frames that have masks OR were edited
         # Note: We only save masks, not RGB. RGB always comes from fresh input images.
+        # CRITICAL: Keep empty masks for frames that were edited (to distinguish from "never edited")
         saved_count = 0
         for idx in range(batch_size):
             if not torch.all(masks[idx] == 0):
-                # Store only mask for edited frames (RGB always uses fresh input)
+                # Store mask for frames with non-empty masks
                 clipspace_masks[idx] = {
                     'mask': masks[idx:idx+1].clone()
                 }
                 saved_count += 1
+            elif idx in new_edits:
+                # User edited this frame and cleared it - keep empty mask to prevent alpha restoration
+                clipspace_masks[idx] = {
+                    'mask': masks[idx:idx+1].clone()
+                }
+                saved_count += 1
+                logging.info(f"[PreviewBridgeVideo] Keeping cleared mask for frame {idx} (user edited)")
             elif idx in clipspace_masks:
-                # Remove frames that no longer have masks
-                del clipspace_masks[idx]
+                # Frame was previously edited but not touched this time - keep it
+                # (Don't delete unless user explicitly edited it to clear)
+                pass
         
         # Store clipspace_masks in video_cache for persistence
         video_cache['clipspace_masks'] = clipspace_masks
