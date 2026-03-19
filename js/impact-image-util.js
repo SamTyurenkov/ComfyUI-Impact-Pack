@@ -165,18 +165,13 @@ app.registerExtension({
 		if(node.comfyClass == "PreviewBridgeVideo") {
 			console.log("[PreviewBridgeVideo] Initializing frontend for node", node.id);
 
-			// New frontend can open mask editor from context menu while only `overIndex` is set.
-			// Mirror that into `imageIndex` so mask editor targets the hovered frame.
+			// Keep selected frame index in sync when clicking thumbnails.
 			const originalOnMouseDown = node.onMouseDown;
 			node.onMouseDown = function() {
 				const result = originalOnMouseDown ? originalOnMouseDown.apply(this, arguments) : undefined;
-				const pointerDownIndex = Number.isInteger(this.pointerDown?.index) ? this.pointerDown.index : null;
-				const clickIndex = pointerDownIndex !== null
-					? pointerDownIndex
-					: (Number.isInteger(this.overIndex) ? this.overIndex : null);
-				if(Number.isInteger(clickIndex)) {
-					this.imageIndex = clickIndex;
-					localStorage.setItem(`pbv_editing_frame_${this.id}`, String(clickIndex));
+				if(Number.isInteger(this.overIndex)) {
+					this.imageIndex = this.overIndex;
+					console.log("[PreviewBridgeVideo] Synced imageIndex from overIndex on click:", this.imageIndex);
 				}
 				return result;
 			};
@@ -187,31 +182,70 @@ app.registerExtension({
 			const originalGetExtraMenuOptions = node.getExtraMenuOptions;
 			node.getExtraMenuOptions = function(canvas, options) {
 				const ret = originalGetExtraMenuOptions ? originalGetExtraMenuOptions.apply(this, arguments) : undefined;
+				pendingOpenFrameIndex = null;
 				if(Array.isArray(options)) {
 					for(let i = 0; i < options.length; i++) {
 						const opt = options[i];
 						if(opt && typeof opt.content === "string" && opt.content.includes("Open in MaskEditor")) {
 							const originalCallback = opt.callback;
-							const pointerDownIndex = Number.isInteger(this.pointerDown?.index) ? this.pointerDown.index : null;
-							const capturedIndex = Number.isInteger(this.overIndex)
-								? this.overIndex
-								: (pointerDownIndex !== null
-								? pointerDownIndex
-								: (Number.isInteger(this.imageIndex) ? this.imageIndex : 0));
 							opt.callback = (...args) => {
-								const preferredIndex = capturedIndex;
+								const preferredIndex = Number.isInteger(this.imageIndex)
+									? this.imageIndex
+									: (Number.isInteger(this.overIndex) ? this.overIndex : 0);
+								console.log("[PreviewBridgeVideo] OpenMaskEditor index candidates:", {
+									imageIndex: this.imageIndex,
+									overIndex: this.overIndex,
+									chosen: preferredIndex
+								});
 								if(Number.isInteger(preferredIndex)) {
 									this.imageIndex = preferredIndex;
+									pendingOpenFrameIndex = preferredIndex;
 									localStorage.setItem(`pbv_editing_frame_${this.id}`, String(preferredIndex));
+									if(ComfyApp?.clipspace?.imgs?.length) {
+										const maxIdx = Math.max(0, ComfyApp.clipspace.imgs.length - 1);
+										ComfyApp.clipspace.selectedIndex = Math.min(Math.max(preferredIndex, 0), maxIdx);
+									}
 								}
 
 								// Mask editor loader resolves node.images[0] first; provide selected metadata briefly.
 								let restoreImages = null;
-								if(Array.isArray(this.images) && this.images.length > 1) {
-									const selectedMeta = this.images[preferredIndex] || this.images[0];
+								if(Array.isArray(this.images)) {
 									restoreImages = this.images;
-									this.images = selectedMeta ? [selectedMeta] : this.images;
 								}
+								let pinnedMeta = null;
+								const selectedImgSrc = Array.isArray(this._imgs) ? this._imgs[preferredIndex]?.src : null;
+								if(typeof selectedImgSrc === "string" && selectedImgSrc.includes("?")) {
+									try {
+										const parsed = new URL(selectedImgSrc, window.location.origin);
+										const filename = parsed.searchParams.get("filename");
+										if(filename) {
+											pinnedMeta = {
+												filename,
+												subfolder: parsed.searchParams.get("subfolder") || "",
+												type: parsed.searchParams.get("type") || "temp"
+											};
+										}
+									} catch {
+										// ignore URL parse failures
+									}
+								}
+								if(!pinnedMeta && Array.isArray(this.images) && this.images.length > 1) {
+									pinnedMeta = this.images[preferredIndex] || this.images[0];
+								}
+								if(pinnedMeta) {
+									this.images = [pinnedMeta];
+									console.log("[PreviewBridgeVideo] Pinned node.images[0] from selected preview src for mask editor open:", preferredIndex);
+
+									// Modern loader prioritizes the image widget value when present.
+									// Keep it aligned with the selected frame so open uses current index.
+									const imageWidget = this.widgets?.find(w => w.name === 'image');
+									const pinnedRef = toRefString(pinnedMeta);
+									if(imageWidget && typeof pinnedRef === "string") {
+										imageWidget.value = pinnedRef;
+										console.log("[PreviewBridgeVideo] Synced image widget for mask editor open:", pinnedRef);
+									}
+								}
+								const cbResult = originalCallback ? originalCallback.apply(this, args) : undefined;
 								if(restoreImages) {
 									setTimeout(() => {
 										try {
@@ -219,9 +253,9 @@ app.registerExtension({
 										} catch {
 											// ignore
 										}
-									}, 120);
+									}, 500);
 								}
-								return originalCallback ? originalCallback.apply(this, args) : undefined;
+								return cbResult;
 							};
 						}
 					}
@@ -334,6 +368,7 @@ app.registerExtension({
 			let pendingSaverReset = false; // Frontend saver does node.imgs=[one] then node.imgs=undefined
 			let pendingSaverFrameIndex = null; // target frame for deferred reference capture
 			let pendingSaverDataUrl = null; // direct saver payload fallback for backend conversion
+			let pendingOpenFrameIndex = null; // selected frame for next mask editor open
 
 			const resolveTargetFrameIndex = () => {
 				const storedIndex = localStorage.getItem(`pbv_editing_frame_${node.id}`);
@@ -366,11 +401,13 @@ app.registerExtension({
 					// Store which frame was clicked in localStorage
 					if(ComfyApp.clipspace_return_node === node && ComfyApp?.clipspace?.selectedIndex !== undefined) {
 						const pointerDownIndex = Number.isInteger(node.pointerDown?.index) ? node.pointerDown.index : null;
-						const preferredIndex = Number.isInteger(node.overIndex)
-							? node.overIndex
+						const preferredIndex = Number.isInteger(pendingOpenFrameIndex)
+							? pendingOpenFrameIndex
+							: (Number.isInteger(node.imageIndex)
+							? node.imageIndex
 							: (pointerDownIndex !== null
 							? pointerDownIndex
-							: (Number.isInteger(node.imageIndex) ? node.imageIndex : null));
+							: (Number.isInteger(node.overIndex) ? node.overIndex : null)));
 
 						// Keep clipspace selection aligned with the node's current frame.
 						// Newer frontend flows can default to frame 0 unless this is synced.
@@ -381,51 +418,15 @@ app.registerExtension({
 						}
 
 						const selectedIdx = ComfyApp.clipspace.selectedIndex;
-						const selectedImg = ComfyApp.clipspace.imgs?.[selectedIdx];
-						const nodeImageIndex = preferredIndex;
-						
-						// Find which position in node._imgs this image is at
-						let frameIndex = null;
-						if(selectedImg && node._imgs) {
-							console.log("[PreviewBridgeVideo] Searching for frame, node._imgs.length:", node._imgs.length);
-							console.log("[PreviewBridgeVideo] Selected image src:", selectedImg.src);
-							
-							// Try exact object match first
-							for(let i = 0; i < node._imgs.length; i++) {
-								if(node._imgs[i] === selectedImg) {
-									frameIndex = i;
-									console.log("[PreviewBridgeVideo] Found frame by object match at index:", i);
-									break;
-								}
-							}
-							
-							// Fallback: try src match (for cases where ComfyUI creates new Image objects)
-							if(frameIndex === null && selectedImg.src) {
-								for(let i = 0; i < node._imgs.length; i++) {
-									const imgSrc = node._imgs[i]?.src;
-									if(imgSrc === selectedImg.src) {
-										frameIndex = i;
-										console.log("[PreviewBridgeVideo] Found frame by src match at index:", i);
-										break;
-									}
-								}
-							}
-						}
-						
-						// Last resort: use node.imageIndex first, then clipspace selectedIdx
-						if(frameIndex === null) {
-							if(nodeImageIndex !== null) {
-								frameIndex = nodeImageIndex;
-								console.log("[PreviewBridgeVideo] Using node.imageIndex as fallback:", frameIndex);
-							} else {
-								frameIndex = selectedIdx;
-								console.log("[PreviewBridgeVideo] Using selectedIdx as fallback:", frameIndex);
-							}
-						}
+						const frameIndex = Number.isInteger(selectedIdx)
+							? selectedIdx
+							: (Number.isInteger(preferredIndex) ? preferredIndex : 0);
+						console.log("[PreviewBridgeVideo] Using deterministic open frame index:", frameIndex);
 						
 						localStorage.setItem(`pbv_editing_frame_${node.id}`, frameIndex.toString());
 						console.log("[PreviewBridgeVideo] Stored frame index in localStorage:", frameIndex);
 						node.imageIndex = frameIndex;
+						pendingOpenFrameIndex = null;
 						
 						// Save the old clipspace reference for this frame (in case user cancels)
 						// and clear it from the widget so mask editor starts fresh
