@@ -459,14 +459,30 @@ app.registerExtension({
 					const isMaskEditorSingleFrameUpdate =
 						!!((fromMaskEditorSaver || hasStoredEditingFrame) && node._imgs && node._imgs.length > 1 && v && v.length === 1);
 					const isClipspace = fromStack || clipspaceReturningToNode || looksLikeCollapsedClipspaceReturn;
+					const isSingleDataUrlSavePreview =
+						!!(Array.isArray(v) && v.length === 1 &&
+							node._imgs && node._imgs.length > 1 &&
+							typeof v[0]?.src === "string" &&
+							v[0].src.startsWith("data:image/"));
 					console.log("[PreviewBridgeVideo] imgs setter called, length:", v ? v.length : 0, "isClipspace:", isClipspace);
 					console.log("[PreviewBridgeVideo] Current node._imgs length:", node._imgs ? node._imgs.length : 0);
-					
+
 					// New frontend saver path may temporarily clear imgs after setting a single-frame preview.
 					// Ignore this reset to keep the full frame batch visible until backend refresh.
 					if((v === undefined || v === null) && pendingSaverReset) {
 						pendingSaverReset = false;
 						console.log("[PreviewBridgeVideo] Ignoring temporary imgs reset from mask editor saver");
+						return;
+					}
+
+					// Defensive: ignore null/undefined writes that would wipe a valid batch.
+					// Some frontend paths can transiently set `node.imgs = undefined`.
+					if(v === undefined || v === null) {
+						if(node._imgs && node._imgs.length > 0) {
+							console.log("[PreviewBridgeVideo] Ignoring null/undefined imgs update to preserve existing batch");
+							return;
+						}
+						node._imgs = [];
 						return;
 					}
 					
@@ -487,6 +503,25 @@ app.registerExtension({
 							node.imageIndex = targetFrameIndex;
 							pendingSaverReset = true;
 							console.log("[PreviewBridgeVideo] Applied single-frame saver update to frame:", targetFrameIndex);
+							if(app && app.canvas) {
+								app.canvas.setDirty(true);
+							}
+							return;
+						}
+					}
+					
+					// New frontend save preview path can arrive as a single data-url image and
+					// would collapse the whole batch if treated as normal backend update.
+					if(isSingleDataUrlSavePreview && v && v[0]) {
+						const storedIndex = localStorage.getItem(`pbv_editing_frame_${node.id}`);
+						const targetFrameIndex = storedIndex !== null ? parseInt(storedIndex, 10) : (Number.isInteger(node.imageIndex) ? node.imageIndex : 0);
+						if(Number.isInteger(targetFrameIndex) && targetFrameIndex >= 0 && targetFrameIndex < node._imgs.length) {
+							const preserved = [...node._imgs];
+							preserved[targetFrameIndex] = v[0];
+							node._imgs = preserved;
+							node.imageIndex = targetFrameIndex;
+							pendingSaverReset = true;
+							console.log("[PreviewBridgeVideo] Applied single data-url save preview to frame:", targetFrameIndex);
 							if(app && app.canvas) {
 								app.canvas.setDirty(true);
 							}
@@ -655,7 +690,14 @@ app.registerExtension({
 					console.log("[PreviewBridgeVideo] clipspace_masks keys:", Object.keys(clipspaceMasksWidget.value));
 				}
 				
-				node._imgs = v || [];
+				if(Array.isArray(v) && v.length > 0) {
+					node._imgs = v;
+					if(Number.isInteger(node.imageIndex) && node.imageIndex >= node._imgs.length) {
+						node.imageIndex = Math.max(0, node._imgs.length - 1);
+					}
+				} else {
+					console.log("[PreviewBridgeVideo] Ignoring normal update with empty image payload");
+				}
 				preservedImgs = null; // Clear preservation since we have new data
 				editedFrameIndex = null;
 				clipspaceImageCount = 0;
@@ -669,6 +711,9 @@ app.registerExtension({
 				get() {
 					if(!node._imgs) {
 						node._imgs = [];
+					}
+					if(node._imgs.length > 0 && Number.isInteger(node.imageIndex) && node.imageIndex >= node._imgs.length) {
+						node.imageIndex = Math.max(0, node._imgs.length - 1);
 					}
 					return node._imgs;
 				}
