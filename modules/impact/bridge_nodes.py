@@ -8,6 +8,8 @@ from PIL import Image
 import numpy as np
 from impact import utils
 import re
+import base64
+import io
 
 # NOTE: this should not be `from . import core`.
 # I don't know why but... 'from .' and 'from impact' refer to different core modules.
@@ -164,6 +166,7 @@ class PreviewBridge:
         return True
 
     def doit(self, images, image, unique_id, block=False, restore_mask="never", prompt=None, extra_pnginfo=None):
+        unique_id = str(unique_id)
         need_refresh = False
         images_changed = False
 
@@ -385,6 +388,7 @@ class PreviewBridgeLatent:
         return image, mask, ui_item
 
     def doit(self, latent, image, preview_method, vae_opt=None, block=False, unique_id=None, restore_mask='never', prompt=None, extra_pnginfo=None):
+        unique_id = str(unique_id)
         latent_channels = latent['samples'].shape[1]
 
         if 'SD3' in preview_method or 'SC-Prior' in preview_method or 'FLUX.1' in preview_method or 'TAEF1' == preview_method:
@@ -575,6 +579,28 @@ class PreviewBridgeVideo:
                 if isinstance(clipspace_file, dict) and 'mask' in clipspace_file:
                     converted[idx] = clipspace_file
                     continue
+
+                # Handle inlined mask payload from frontend saver (data URL)
+                if isinstance(clipspace_file, dict) and isinstance(clipspace_file.get('data_url'), str):
+                    data_url = clipspace_file.get('data_url')
+                    if data_url.startswith("data:image/") and "," in data_url:
+                        try:
+                            payload = data_url.split(",", 1)[1]
+                            raw = base64.b64decode(payload)
+                            with Image.open(io.BytesIO(raw)) as pil_img:
+                                pil_img = ImageOps.exif_transpose(pil_img)
+                                if 'A' in pil_img.getbands():
+                                    alpha = np.array(pil_img.getchannel('A')).astype(np.float32) / 255.0
+                                    loaded_mask = (1.0 - torch.from_numpy(alpha)).unsqueeze(0)
+                                else:
+                                    loaded_mask = torch.zeros((1, pil_img.height, pil_img.width), dtype=torch.float32, device="cpu")
+                            converted[idx] = {
+                                'mask': loaded_mask
+                            }
+                            logging.info(f"[PreviewBridgeVideo] Loaded clipspace mask for frame {idx} from data_url")
+                            continue
+                        except Exception as e:
+                            logging.warning(f"[PreviewBridgeVideo] Failed to decode data_url for frame {idx}: {e}")
                 
                 # Handle file reference (string path) - load mask only
                 if isinstance(clipspace_file, str):
@@ -650,30 +676,12 @@ class PreviewBridgeVideo:
         return mask
 
     def doit(self, images, unique_id, block=False, restore_mask="if_same_size", prompt=None, extra_pnginfo=None, clipspace_masks=None):
+        unique_id = str(unique_id)
         batch_size = images.shape[0]
         
         logging.info(f"[PreviewBridgeVideo] === Execution Start ===")
         logging.info(f"[PreviewBridgeVideo] unique_id={unique_id}, batch_size={batch_size}, restore_mask={restore_mask}")
         logging.info(f"[PreviewBridgeVideo] clipspace_masks: {clipspace_masks if not isinstance(clipspace_masks, dict) or len(clipspace_masks) < 3 else f'dict with {len(clipspace_masks)} frames'}")
-        
-        # Clean up old preview files for this node to avoid accumulation
-        try:
-            preview_dir = os.path.join(folder_paths.get_temp_directory(), 'PreviewBridge')
-            if os.path.exists(preview_dir):
-                pattern = f"PBV-{unique_id}-"
-                removed_count = 0
-                for filename in os.listdir(preview_dir):
-                    if filename.startswith(pattern):
-                        file_path = os.path.join(preview_dir, filename)
-                        try:
-                            os.remove(file_path)
-                            removed_count += 1
-                        except Exception as e:
-                            logging.warning(f"[PreviewBridgeVideo] Failed to remove old file {filename}: {e}")
-                if removed_count > 0:
-                    logging.info(f"[PreviewBridgeVideo] Cleaned up {removed_count} old preview files")
-        except Exception as e:
-            logging.warning(f"[PreviewBridgeVideo] Failed to clean up old preview files: {e}")
         
         # Use unique_id directly as cache key so it won't be garbage collected
         # Store video-specific data in a nested structure to avoid conflicts with other PreviewBridge types
@@ -904,6 +912,27 @@ class PreviewBridgeVideo:
         
         # Store clipspace_masks in video_cache for persistence
         video_cache['clipspace_masks'] = clipspace_masks
+
+        # Clean up stale preview files only after conversion/restore has completed.
+        # This avoids deleting frontend references before they are converted to tensors.
+        try:
+            preview_dir = os.path.join(folder_paths.get_temp_directory(), 'PreviewBridge')
+            if os.path.exists(preview_dir):
+                keep_filenames = {img.get('filename') for img in image_list if isinstance(img, dict) and img.get('filename')}
+                pattern = f"PBV-{unique_id}-"
+                removed_count = 0
+                for filename in os.listdir(preview_dir):
+                    if filename.startswith(pattern) and filename not in keep_filenames:
+                        file_path = os.path.join(preview_dir, filename)
+                        try:
+                            os.remove(file_path)
+                            removed_count += 1
+                        except Exception as e:
+                            logging.warning(f"[PreviewBridgeVideo] Failed to remove old file {filename}: {e}")
+                if removed_count > 0:
+                    logging.info(f"[PreviewBridgeVideo] Cleaned up {removed_count} stale preview files")
+        except Exception as e:
+            logging.warning(f"[PreviewBridgeVideo] Failed to clean up stale preview files: {e}")
         
         logging.info(f"[PreviewBridgeVideo] Saved {saved_count} frames with masks")
         logging.info(f"[PreviewBridgeVideo] Final image_list order:")
