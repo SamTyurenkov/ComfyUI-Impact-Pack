@@ -16,6 +16,22 @@ from impact import core
 # <--
 import random
 
+ANNOTATED_PATH_PATTERN = re.compile(r"\s*\[(input|output|temp)\]\s*$", re.IGNORECASE)
+
+
+def _split_annotated_path(path, default_type="input"):
+    if not isinstance(path, str):
+        return "", default_type
+
+    normalized = path.replace("\\", "/").strip()
+    annotation = ANNOTATED_PATH_PATTERN.search(normalized)
+    path_type = default_type
+    if annotation:
+        path_type = annotation.group(1).lower()
+        normalized = normalized[:annotation.start()].strip()
+
+    return normalized, path_type
+
 
 class PreviewBridge:
     @classmethod
@@ -88,15 +104,31 @@ class PreviewBridge:
         This handles the case where ComfyUI's mask editor creates clipspace files
         that need to be integrated with the preview bridge system.
         """
-        # Remove [input] suffix if present
-        clean_path = clipspace_path.replace(" [input]", "").replace("[input]", "")
-        
-        # Try to find the actual clipspace file
-        input_dir = folder_paths.get_input_directory()
+        clean_path, path_type = _split_annotated_path(clipspace_path, default_type="input")
+        if clean_path == "":
+            return False
+
+        try:
+            base_dir = folder_paths.get_directory_by_type(path_type)
+        except Exception:
+            base_dir = None
+
+        if base_dir is None:
+            base_dir = folder_paths.get_input_directory()
+
+        rel_path = clean_path.lstrip("/").replace("\\", "/")
+        filename = os.path.basename(rel_path)
+        if filename == "":
+            return False
+
+        subfolder = os.path.dirname(rel_path).replace("\\", "/")
+
         potential_paths = [
-            clean_path,
-            os.path.join(input_dir, clean_path),
-            os.path.join(input_dir, "clipspace", os.path.basename(clean_path)),
+            folder_paths.get_annotated_filepath(clean_path, default_dir=base_dir),
+            os.path.join(base_dir, rel_path),
+            os.path.join(base_dir, filename),
+            os.path.join(base_dir, "clipspace", filename),
+            os.path.join(folder_paths.get_input_directory(), "clipspace", filename),
             os.path.abspath(clean_path),
         ]
         
@@ -109,17 +141,25 @@ class PreviewBridge:
         if not actual_file:
             return False
             
-        # Create ui_item for the clipspace file
+        try:
+            relative_from_base = os.path.relpath(actual_file, base_dir).replace("\\", "/")
+            if not relative_from_base.startswith(".."):
+                filename = os.path.basename(relative_from_base)
+                subfolder = os.path.dirname(relative_from_base).replace("\\", "/")
+        except Exception:
+            pass
+
         ui_item = {
-            'filename': os.path.basename(actual_file),
-            'subfolder': 'clipspace',
-            'type': 'input'
+            'filename': filename,
+            'subfolder': subfolder,
+            'type': path_type
         }
         
         # Register it using the preview bridge system
         core.set_previewbridge_image(node_id, actual_file, ui_item)
-        # Also register under the original clipspace path for compatibility
+        normalized_ref = f"{subfolder + '/' if subfolder else ''}{filename} [{path_type}]"
         core.preview_bridge_image_id_map[clipspace_path] = (actual_file, ui_item)
+        core.preview_bridge_image_id_map[normalized_ref] = (actual_file, ui_item)
         
         return True
 
@@ -145,7 +185,7 @@ class PreviewBridge:
         # This only applies when images haven't changed (same image, new mask scenario)
         if not need_refresh and image not in core.preview_bridge_image_id_map:
             # Check if this is a clipspace file that needs to be registered
-            is_clipspace = image and ("clipspace" in image.lower() or "[input]" in image)
+            is_clipspace = bool(image and ("clipspace" in image.lower() or ANNOTATED_PATH_PATTERN.search(image)))
             if is_clipspace:
                 if not PreviewBridge.register_clipspace_image(image, unique_id):
                     need_refresh = True
@@ -380,7 +420,7 @@ class PreviewBridgeLatent:
         # Handle clipspace files that aren't registered in the preview bridge system
         # This only applies when latent hasn't changed (same latent, new mask scenario)
         if not need_refresh and image not in core.preview_bridge_image_id_map:
-            is_clipspace = image and ("clipspace" in image.lower() or "[input]" in image)
+            is_clipspace = bool(image and ("clipspace" in image.lower() or ANNOTATED_PATH_PATTERN.search(image)))
             if is_clipspace:
                 if not PreviewBridge.register_clipspace_image(image, unique_id):
                     need_refresh = True

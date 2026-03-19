@@ -9,21 +9,24 @@ function load_image(str) {
 
 function getFileItem(baseType, path) {
 	try {
-		let pathType = baseType;
-
-		if (path.endsWith("[output]")) {
-			pathType = "output";
-			path = path.slice(0, -9);
-		} else if (path.endsWith("[input]")) {
-			pathType = "input";
-			path = path.slice(0, -8);
-		} else if (path.endsWith("[temp]")) {
-			pathType = "temp";
-			path = path.slice(0, -7);
+		if(!path || typeof path !== "string") {
+			return null;
 		}
 
-		const subfolder = path.substring(0, path.lastIndexOf('/'));
-		const filename = path.substring(path.lastIndexOf('/') + 1);
+		path = path.replace(/\\/g, '/').trim();
+		let pathType = baseType;
+		const annotation = path.match(/\s*\[(output|input|temp)\]\s*$/i);
+		if(annotation) {
+			pathType = annotation[1].toLowerCase();
+			path = path.slice(0, annotation.index).trim();
+		}
+
+		const slashIndex = path.lastIndexOf('/');
+		const subfolder = slashIndex >= 0 ? path.substring(0, slashIndex) : "";
+		const filename = slashIndex >= 0 ? path.substring(slashIndex + 1) : path;
+		if(!filename) {
+			return null;
+		}
 
 		return {
 			filename: filename,
@@ -36,6 +39,24 @@ function getFileItem(baseType, path) {
 	}
 }
 
+function getViewUrl(item) {
+	const params = new URLSearchParams();
+	params.set("filename", item.filename);
+	params.set("type", item.type || "temp");
+	if(item.subfolder) {
+		params.set("subfolder", item.subfolder);
+	}
+
+	let url = api.apiURL(`/view?${params.toString()}`);
+	if(app.getPreviewFormatParam) {
+		url += app.getPreviewFormatParam();
+	}
+	if(app.getRandParam) {
+		url += app.getRandParam();
+	}
+	return url;
+}
+
 async function loadImageFromUrl(image, node_id, v, need_to_load) {
 	let item = getFileItem('temp', v);
 
@@ -45,8 +66,8 @@ async function loadImageFromUrl(image, node_id, v, need_to_load) {
 		let res = await api.fetchApi('/impact/set/pb_id_image'+params, { cache: "no-store" });
 		if(res.status == 200) {
 			let pb_id = await res.text();
-			if(need_to_load) {;
-				image.src = api.apiURL(`/view?filename=${item.filename}&type=${item.type}&subfolder=${item.subfolder}`);
+			if(need_to_load) {
+				image.src = getViewUrl(item);
 			}
 			return pb_id;
 		}
@@ -63,7 +84,7 @@ async function loadImageFromId(image, v) {
 	let res = await api.fetchApi('/impact/get/pb_id_image?id='+v, { cache: "no-store" });
 	if(res.status == 200) {
 		let item = await res.json();
-		image.src = api.apiURL(`/view?filename=${item.filename}&type=${item.type}&subfolder=${item.subfolder}`);
+		image.src = getViewUrl(item);
 		return true;
 	}
 
@@ -143,7 +164,81 @@ app.registerExtension({
 
 		if(node.comfyClass == "PreviewBridgeVideo") {
 			console.log("[PreviewBridgeVideo] Initializing frontend for node", node.id);
-			
+
+			// New frontend can open mask editor from context menu while only `overIndex` is set.
+			// Mirror that into `imageIndex` so mask editor targets the hovered frame.
+			const originalOnMouseDown = node.onMouseDown;
+			node.onMouseDown = function() {
+				const result = originalOnMouseDown ? originalOnMouseDown.apply(this, arguments) : undefined;
+				if(Number.isInteger(this.overIndex)) {
+					this.imageIndex = this.overIndex;
+				}
+				return result;
+			};
+
+			// Core frontend context-menu action ("Open in MaskEditor | Image Canvas")
+			// can call mask editor directly without going through ComfyApp.open_maskeditor.
+			// Ensure imageIndex is pinned to hovered frame before the callback executes.
+			const originalGetExtraMenuOptions = node.getExtraMenuOptions;
+			node.getExtraMenuOptions = function(canvas, options) {
+				const ret = originalGetExtraMenuOptions ? originalGetExtraMenuOptions.apply(this, arguments) : undefined;
+				if(Array.isArray(options)) {
+					for(let i = 0; i < options.length; i++) {
+						const opt = options[i];
+						if(opt && typeof opt.content === "string" && opt.content.includes("Open in MaskEditor")) {
+							const originalCallback = opt.callback;
+							opt.callback = (...args) => {
+								const preferredIndex = Number.isInteger(this.overIndex)
+									? this.overIndex
+									: (Number.isInteger(this.imageIndex) ? this.imageIndex : 0);
+								if(Number.isInteger(preferredIndex)) {
+									this.imageIndex = preferredIndex;
+								}
+
+								// Latest mask editor loader resolves node.images[0] before node.imageIndex.
+								// For batch previews, temporarily expose only the selected frame.
+								let restoreImages = null;
+								if(Array.isArray(this.images) && this.images.length > 1) {
+									const selectedMeta = this.images[preferredIndex] || this.images[0];
+									restoreImages = this.images;
+									this.images = selectedMeta ? [selectedMeta] : this.images;
+								} else if((!Array.isArray(this.images) || this.images.length === 0) && Array.isArray(this._imgs) && this._imgs[preferredIndex]?.src) {
+									try {
+										const parsed = new URL(this._imgs[preferredIndex].src, window.location.origin);
+										const filename = parsed.searchParams.get("filename");
+										if(filename) {
+											restoreImages = this.images;
+											this.images = [{
+												filename,
+												subfolder: parsed.searchParams.get("subfolder") || "",
+												type: parsed.searchParams.get("type") || "temp"
+											}];
+										}
+									} catch {
+										// best effort only
+									}
+								}
+
+								// Restore original images shortly after opening.
+								if(restoreImages) {
+									setTimeout(() => {
+										try {
+											if(this.images !== restoreImages) {
+												this.images = restoreImages;
+											}
+										} catch {
+											// ignore restore failures
+										}
+									}, 1500);
+								}
+								return originalCallback ? originalCallback.apply(this, args) : undefined;
+							};
+						}
+					}
+				}
+				return ret;
+			};
+
 			// Initialize clipspace_masks widget if it doesn't exist
 			let clipspaceMasksWidget = node.widgets.find(obj => obj.name === 'clipspace_masks');
 			if(!clipspaceMasksWidget) {
@@ -171,6 +266,7 @@ app.registerExtension({
 			let editedFrameIndex = null;
 			let clipspaceImageCount = 0;
 			let savedClipspaceRef = null; // Store old clipspace reference to restore if user cancels
+			let pendingSaverReset = false; // Frontend saver does node.imgs=[one] then node.imgs=undefined
 			
 			// Wrap ComfyApp.open_maskeditor to capture the frame index when it's opened
 			if(!node._maskeditorWrapped && ComfyApp.open_maskeditor) {
@@ -187,8 +283,21 @@ app.registerExtension({
 					
 					// Store which frame was clicked in localStorage
 					if(ComfyApp.clipspace_return_node === node && ComfyApp?.clipspace?.selectedIndex !== undefined) {
+						const preferredIndex = Number.isInteger(node.imageIndex)
+							? node.imageIndex
+							: (Number.isInteger(node.overIndex) ? node.overIndex : null);
+
+						// Keep clipspace selection aligned with the node's current frame.
+						// Newer frontend flows can default to frame 0 unless this is synced.
+						if(preferredIndex !== null && ComfyApp.clipspace?.imgs?.length) {
+							const maxIdx = Math.max(0, ComfyApp.clipspace.imgs.length - 1);
+							const syncedIdx = Math.min(Math.max(preferredIndex, 0), maxIdx);
+							ComfyApp.clipspace.selectedIndex = syncedIdx;
+						}
+
 						const selectedIdx = ComfyApp.clipspace.selectedIndex;
 						const selectedImg = ComfyApp.clipspace.imgs?.[selectedIdx];
+						const nodeImageIndex = preferredIndex;
 						
 						// Find which position in node._imgs this image is at
 						let frameIndex = null;
@@ -218,14 +327,20 @@ app.registerExtension({
 							}
 						}
 						
-						// Last resort: use clipspace selectedIdx
+						// Last resort: use node.imageIndex first, then clipspace selectedIdx
 						if(frameIndex === null) {
-							frameIndex = selectedIdx;
-							console.log("[PreviewBridgeVideo] Using selectedIdx as fallback:", frameIndex);
+							if(nodeImageIndex !== null) {
+								frameIndex = nodeImageIndex;
+								console.log("[PreviewBridgeVideo] Using node.imageIndex as fallback:", frameIndex);
+							} else {
+								frameIndex = selectedIdx;
+								console.log("[PreviewBridgeVideo] Using selectedIdx as fallback:", frameIndex);
+							}
 						}
 						
 						localStorage.setItem(`pbv_editing_frame_${node.id}`, frameIndex.toString());
 						console.log("[PreviewBridgeVideo] Stored frame index in localStorage:", frameIndex);
+						node.imageIndex = frameIndex;
 						
 						// Save the old clipspace reference for this frame (in case user cancels)
 						// and clear it from the widget so mask editor starts fresh
@@ -335,39 +450,78 @@ app.registerExtension({
 			Object.defineProperty(node, 'imgs', {
 				set(v) {
 					const stackTrace = new Error().stack;
-					const isClipspace = stackTrace.includes('pasteFromClipspace');
+					const fromStack = stackTrace.includes('pasteFromClipspace');
+					const clipspaceReturningToNode = ComfyApp.clipspace_return_node === node;
+					const fromMaskEditorSaver = stackTrace.includes('useMaskEditorSaver');
+					const looksLikeCollapsedClipspaceReturn =
+						!!(clipspaceReturningToNode && node._imgs && node._imgs.length > 1 && v && v.length === 1);
+					const hasStoredEditingFrame = localStorage.getItem(`pbv_editing_frame_${node.id}`) !== null;
+					const isMaskEditorSingleFrameUpdate =
+						!!((fromMaskEditorSaver || hasStoredEditingFrame) && node._imgs && node._imgs.length > 1 && v && v.length === 1);
+					const isClipspace = fromStack || clipspaceReturningToNode || looksLikeCollapsedClipspaceReturn;
 					console.log("[PreviewBridgeVideo] imgs setter called, length:", v ? v.length : 0, "isClipspace:", isClipspace);
 					console.log("[PreviewBridgeVideo] Current node._imgs length:", node._imgs ? node._imgs.length : 0);
+					
+					// New frontend saver path may temporarily clear imgs after setting a single-frame preview.
+					// Ignore this reset to keep the full frame batch visible until backend refresh.
+					if((v === undefined || v === null) && pendingSaverReset) {
+						pendingSaverReset = false;
+						console.log("[PreviewBridgeVideo] Ignoring temporary imgs reset from mask editor saver");
+						return;
+					}
 					
 					if(v && v.length == 0) {
 						console.log("[PreviewBridgeVideo] Ignoring empty array");
 						return;
 					}
 					
+					// Handle the new mask editor saver behavior that writes a single-frame preview directly.
+					// Update only the edited frame instead of replacing the whole batch.
+					if(isMaskEditorSingleFrameUpdate && v && v[0]) {
+						const storedIndex = localStorage.getItem(`pbv_editing_frame_${node.id}`);
+						const targetFrameIndex = storedIndex !== null ? parseInt(storedIndex, 10) : (Number.isInteger(node.imageIndex) ? node.imageIndex : 0);
+						if(Number.isInteger(targetFrameIndex) && targetFrameIndex >= 0 && targetFrameIndex < node._imgs.length) {
+							const preserved = [...node._imgs];
+							preserved[targetFrameIndex] = v[0];
+							node._imgs = preserved;
+							node.imageIndex = targetFrameIndex;
+							pendingSaverReset = true;
+							console.log("[PreviewBridgeVideo] Applied single-frame saver update to frame:", targetFrameIndex);
+							if(app && app.canvas) {
+								app.canvas.setDirty(true);
+							}
+							return;
+						}
+					}
+
 					// When pasting from clipspace (mask editor), handle the edited frame
 					if(isClipspace) {
+						if(!v || !v[0] || !v[0].src) {
+							console.warn("[PreviewBridgeVideo] Clipspace path without image payload - skipping");
+							return;
+						}
 						console.log("[PreviewBridgeVideo] Detected pasteFromClipspace!");
 						console.log("[PreviewBridgeVideo] Image source:", v[0].src);
 						
-					// Preserve the current imgs array on first clipspace call
-					if(!preservedImgs && node._imgs) {
-						preservedImgs = [...node._imgs];
-						clipspaceImageCount = 0;
-						console.log("[PreviewBridgeVideo] Preserved imgs array, length:", preservedImgs.length);
-						
-						// Retrieve frame index from localStorage
-						const storedIndex = localStorage.getItem(`pbv_editing_frame_${node.id}`);
-						editedFrameIndex = storedIndex !== null ? parseInt(storedIndex, 10) : 0;
-						console.log("[PreviewBridgeVideo] Retrieved frame index from localStorage:", editedFrameIndex);
-						console.log("[PreviewBridgeVideo] editedFrameIndex is valid?", editedFrameIndex >= 0 && editedFrameIndex < preservedImgs.length);
-						
-						// Validate frame index
-						if(editedFrameIndex < 0 || editedFrameIndex >= preservedImgs.length) {
-							console.error("[PreviewBridgeVideo] Invalid frame index from localStorage:", editedFrameIndex, "valid range: 0-" + (preservedImgs.length - 1));
-							editedFrameIndex = 0;
+						// Preserve the current imgs array on first clipspace call
+						if(!preservedImgs && node._imgs) {
+							preservedImgs = [...node._imgs];
+							clipspaceImageCount = 0;
+							console.log("[PreviewBridgeVideo] Preserved imgs array, length:", preservedImgs.length);
+							
+							// Retrieve frame index from localStorage
+							const storedIndex = localStorage.getItem(`pbv_editing_frame_${node.id}`);
+							editedFrameIndex = storedIndex !== null ? parseInt(storedIndex, 10) : 0;
+							console.log("[PreviewBridgeVideo] Retrieved frame index from localStorage:", editedFrameIndex);
+							console.log("[PreviewBridgeVideo] editedFrameIndex is valid?", editedFrameIndex >= 0 && editedFrameIndex < preservedImgs.length);
+							
+							// Validate frame index
+							if(editedFrameIndex < 0 || editedFrameIndex >= preservedImgs.length) {
+								console.error("[PreviewBridgeVideo] Invalid frame index from localStorage:", editedFrameIndex, "valid range: 0-" + (preservedImgs.length - 1));
+								editedFrameIndex = 0;
+							}
 						}
-					}
-						
+							
 						// IMPORTANT: Always restore the preserved array to block external modifications
 						// Even if we can't detect which frame was edited
 						if(preservedImgs) {
@@ -484,10 +638,10 @@ app.registerExtension({
 				// Normal update from backend execution - replace entire array
 				// The backend always sends ALL frames, so we replace everything
 				console.log("[PreviewBridgeVideo] Normal update - replacing entire imgs array");
-				console.log("[PreviewBridgeVideo] Received images:", v.length);
+				console.log("[PreviewBridgeVideo] Received images:", v ? v.length : 0);
 				
 				// Log the filename of each image to verify order
-				v.forEach((img, idx) => {
+				(v || []).forEach((img, idx) => {
 					if(img && img.src) {
 						let match = img.src.match(/PBV-\d+-(\d{4})/);
 						let frameIdx = match ? match[1] : 'unknown';
@@ -501,7 +655,7 @@ app.registerExtension({
 					console.log("[PreviewBridgeVideo] clipspace_masks keys:", Object.keys(clipspaceMasksWidget.value));
 				}
 				
-				node._imgs = v;
+				node._imgs = v || [];
 				preservedImgs = null; // Clear preservation since we have new data
 				editedFrameIndex = null;
 				clipspaceImageCount = 0;
