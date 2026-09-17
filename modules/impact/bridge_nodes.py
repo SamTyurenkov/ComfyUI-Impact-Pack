@@ -215,7 +215,10 @@ class PreviewBridge:
                 mask = None
 
             if mask is None:
-                mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu").unsqueeze(0)
+                if images.shape[-1] == 4:
+                    mask = 1.0 - images[..., 3]
+                else:
+                    mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu").unsqueeze(0)
                 res = nodes.PreviewImage().save_images(images, filename_prefix="PreviewBridge/PB-", prompt=prompt, extra_pnginfo=extra_pnginfo)
             else:
                 masked_images = utils.tensor_convert_rgba(images)
