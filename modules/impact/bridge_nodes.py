@@ -184,15 +184,17 @@ class PreviewBridge:
         if images_changed and restore_mask not in ["always", "if_same_size"] and unique_id in core.preview_bridge_last_mask_cache:
             del core.preview_bridge_last_mask_cache[unique_id]
 
-        # Handle clipspace files that aren't registered in the preview bridge system
-        # This only applies when images haven't changed (same image, new mask scenario)
-        if not need_refresh and image not in core.preview_bridge_image_id_map:
-            # Check if this is a clipspace file that needs to be registered
+        # Handle clipspace files that aren't registered in the preview bridge system.
+        # ComfyUI 0.38 writes the saved MaskEditor filename directly to its widget
+        # store, bypassing the frontend setter that previously registered the file.
+        if image not in core.preview_bridge_image_id_map:
             is_clipspace = bool(image and ("clipspace" in image.lower() or ANNOTATED_PATH_PATTERN.search(image)))
             if is_clipspace:
-                if not PreviewBridge.register_clipspace_image(image, unique_id):
+                if PreviewBridge.register_clipspace_image(image, unique_id):
+                    need_refresh = False
+                elif not need_refresh:
                     need_refresh = True
-            else:
+            elif not need_refresh:
                 need_refresh = True
 
         if not need_refresh:
@@ -424,14 +426,16 @@ class PreviewBridgeLatent:
         if latent_changed and restore_mask not in ["always", "if_same_size"] and unique_id in core.preview_bridge_last_mask_cache:
             del core.preview_bridge_last_mask_cache[unique_id]
 
-        # Handle clipspace files that aren't registered in the preview bridge system
-        # This only applies when latent hasn't changed (same latent, new mask scenario)
-        if not need_refresh and image not in core.preview_bridge_image_id_map:
+        # Handle MaskEditor files even when the latent object changed. ComfyUI 0.38
+        # bypasses the frontend registration setter when it updates the image widget.
+        if image not in core.preview_bridge_image_id_map:
             is_clipspace = bool(image and ("clipspace" in image.lower() or ANNOTATED_PATH_PATTERN.search(image)))
             if is_clipspace:
-                if not PreviewBridge.register_clipspace_image(image, unique_id):
+                if PreviewBridge.register_clipspace_image(image, unique_id):
+                    need_refresh = False
+                elif not need_refresh:
                     need_refresh = True
-            else:
+            elif not need_refresh:
                 need_refresh = True
 
         if not need_refresh:
