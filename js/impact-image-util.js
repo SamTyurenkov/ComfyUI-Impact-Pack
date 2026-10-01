@@ -228,6 +228,9 @@ app.registerExtension({
 				if(resetMaskEditor) {
 					const currentPreview = `$${node.id}-0`;
 					const widgetIndex = node.widgets.indexOf(w);
+					if(Array.isArray(message?.images) && message.images.length > 0) {
+						node.images = message.images;
+					}
 					w._value = currentPreview;
 					if(node.properties) {
 						node.properties.image = currentPreview;
