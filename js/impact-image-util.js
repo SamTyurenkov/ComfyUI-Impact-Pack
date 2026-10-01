@@ -57,6 +57,15 @@ function getViewUrl(item) {
 	return url;
 }
 
+function getAnnotatedPath(item) {
+	if(!item?.filename) {
+		return null;
+	}
+
+	const subfolder = item.subfolder ? `${item.subfolder}/` : "";
+	return `${subfolder}${item.filename} [${item.type || "input"}]`;
+}
+
 async function loadImageFromUrl(image, node_id, v, need_to_load) {
 	let item = getFileItem('temp', v);
 
@@ -125,8 +134,15 @@ app.registerExtension({
 					}
 					else {
 						// from clipspace
+						let source = v;
+						const parsed = getFileItem('input', v);
+						const serverItem = Array.isArray(node.images) ? node.images[0] : null;
+						if(parsed?.filename === serverItem?.filename) {
+							source = getAnnotatedPath(serverItem) || v;
+						}
+
 						w._lock = true;
-						w._value = await loadImageFromUrl(image, node.id, v, false);
+						w._value = await loadImageFromUrl(image, node.id, source, false);
 						w._lock = false;
 					}
 				},
@@ -140,6 +156,14 @@ app.registerExtension({
 
 			Object.defineProperty(node, 'imgs', {
 				set(v) {
+					if(v === undefined || v === null) {
+						if(node._imgs?.length) {
+							return;
+						}
+						node._imgs = [];
+						return;
+					}
+
 					const stackTrace = new Error().stack;
 					if(v && v.length == 0)
 						return;
