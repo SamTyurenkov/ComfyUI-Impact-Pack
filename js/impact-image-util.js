@@ -217,6 +217,28 @@ app.registerExtension({
 					return node._imgs;
 				}
 			});
+
+			const originalOnExecuted = node.onExecuted;
+			node.onExecuted = function(message) {
+				const result = originalOnExecuted?.apply(this, arguments);
+				const resetMaskEditor = Array.isArray(message?.reset_mask_editor)
+					? message.reset_mask_editor[0]
+					: message?.reset_mask_editor;
+
+				if(resetMaskEditor) {
+					const currentPreview = `$${node.id}-0`;
+					const widgetIndex = node.widgets.indexOf(w);
+					w._value = currentPreview;
+					if(node.properties) {
+						node.properties.image = currentPreview;
+					}
+					if(widgetIndex >= 0 && Array.isArray(node.widgets_values)) {
+						node.widgets_values[widgetIndex] = currentPreview;
+					}
+				}
+
+				return result;
+			};
 		}
 
 		if(node.comfyClass == "PreviewBridgeVideo") {

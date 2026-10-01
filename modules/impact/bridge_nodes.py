@@ -178,10 +178,8 @@ class PreviewBridge:
             need_refresh = True
             images_changed = True
 
-        # If images changed, clear the mask cache to ensure fresh start behavior
-        # This restores the original behavior where new images start with empty masks
-        # unless restore_mask is set to "always" or "if_same_size"
-        if images_changed and restore_mask not in ["always", "if_same_size"] and unique_id in core.preview_bridge_last_mask_cache:
+        # A mask belongs to the frame it was painted on and must not leak to a new input.
+        if images_changed and unique_id in core.preview_bridge_last_mask_cache:
             del core.preview_bridge_last_mask_cache[unique_id]
 
         # Handle clipspace files that aren't registered in the preview bridge system.
@@ -191,7 +189,8 @@ class PreviewBridge:
             is_clipspace = bool(image and ("clipspace" in image.lower() or ANNOTATED_PATH_PATTERN.search(image)))
             if is_clipspace:
                 if PreviewBridge.register_clipspace_image(image, unique_id):
-                    need_refresh = False
+                    if not images_changed:
+                        need_refresh = False
                 elif not need_refresh:
                     need_refresh = True
             elif not need_refresh:
@@ -201,11 +200,7 @@ class PreviewBridge:
             pixels, mask, path_item = PreviewBridge.load_image(image)
             image = [path_item]
         else:
-            # For new images (images_changed=True), we want to start fresh regardless of restore_mask
-            # For same image with refresh needed, respect the restore_mask setting
-            # Exception: when restore_mask is "always", restore even with new images
-            # Exception: when restore_mask is "if_same_size", allow restoration to check size compatibility
-            if restore_mask != "never" and (not images_changed or restore_mask in ["always", "if_same_size"]):
+            if not images_changed and restore_mask != "never":
                 mask = core.preview_bridge_last_mask_cache.get(unique_id)
                 if mask is None:
                     mask = None
@@ -251,7 +246,7 @@ class PreviewBridge:
             core.preview_bridge_last_mask_cache[unique_id] = mask
 
         return {
-            "ui": {"images": image},
+            "ui": {"images": image, "reset_mask_editor": [images_changed]},
             "result": result,
         }
 
