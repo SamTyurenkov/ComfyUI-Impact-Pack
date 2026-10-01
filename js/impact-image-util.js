@@ -109,6 +109,18 @@ app.registerExtension({
 			node._imgs = [new Image()];
 			node.imageIndex = 0;
 
+			let widgetValueDescriptor;
+			let widgetPrototype = Object.getPrototypeOf(w);
+			while(widgetPrototype && !widgetValueDescriptor) {
+				widgetValueDescriptor = Object.getOwnPropertyDescriptor(widgetPrototype, 'value');
+				widgetPrototype = Object.getPrototypeOf(widgetPrototype);
+			}
+
+			const setWidgetValue = (value) => {
+				widgetValueDescriptor?.set?.call(w, value);
+				w._value = value;
+			};
+
 			const syncMaskEditorImage = async () => {
 				const serverItem = Array.isArray(node.images) ? node.images[0] : null;
 				if(!serverItem?.filename?.startsWith("clipspace-painted-masked-")) {
@@ -122,14 +134,14 @@ app.registerExtension({
 
 				const image = new Image();
 				const widgetIndex = node.widgets.indexOf(w);
-				w._value = source;
+				setWidgetValue(source);
 				if(widgetIndex >= 0 && Array.isArray(node.widgets_values)) {
 					node.widgets_values[widgetIndex] = source;
 				}
 
 				w._lock = true;
 				try {
-					w._value = await loadImageFromUrl(image, node.id, source, true);
+					setWidgetValue(await loadImageFromUrl(image, node.id, source, true));
 					if(widgetIndex >= 0 && Array.isArray(node.widgets_values)) {
 						node.widgets_values[widgetIndex] = w._value;
 					}
@@ -153,15 +165,15 @@ app.registerExtension({
 					var image = new Image();
 					if(v && v.constructor == String && v.startsWith('$')) {
 						// from node feedback
+						setWidgetValue(v);
 						let need_to_load = node._imgs[0].src == '';
 						if(await loadImageFromId(image, v, need_to_load)) {
-							w._value = v;
 							if(node._imgs[0].src == '') {
 								node._imgs = [image];
 							}
 						}
 						else {
-							w._value = `$${node.id}-0`;
+							setWidgetValue(`$${node.id}-0`);
 						}
 					}
 					else {
@@ -173,14 +185,15 @@ app.registerExtension({
 							source = getAnnotatedPath(serverItem) || v;
 						}
 
+						setWidgetValue(source);
 						w._lock = true;
-						w._value = await loadImageFromUrl(image, node.id, source, false);
+						setWidgetValue(await loadImageFromUrl(image, node.id, source, false));
 						w._lock = false;
 					}
 				},
 				get() {
 					if(w._value == undefined) {
-						w._value = `$${node.id}-0`;
+						setWidgetValue(`$${node.id}-0`);
 					}
 					return w._value;
 				}
@@ -231,7 +244,7 @@ app.registerExtension({
 					if(Array.isArray(message?.images) && message.images.length > 0) {
 						node.images = message.images;
 					}
-					w._value = currentPreview;
+					setWidgetValue(currentPreview);
 					if(node.properties) {
 						node.properties.image = currentPreview;
 					}
