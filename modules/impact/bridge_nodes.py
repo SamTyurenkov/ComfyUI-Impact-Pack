@@ -219,9 +219,12 @@ class PreviewBridge:
             if mask is None:
                 if images.shape[-1] == 4:
                     mask = 1.0 - images[..., 3]
+                    masked_images = utils.tensor_convert_rgba(images)
+                    utils.tensor_putalpha(masked_images, images[..., 3].unsqueeze(3))
+                    res = nodes.PreviewImage().save_images(masked_images, filename_prefix="PreviewBridge/PB-", prompt=prompt, extra_pnginfo=extra_pnginfo)
                 else:
                     mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu").unsqueeze(0)
-                res = nodes.PreviewImage().save_images(images, filename_prefix="PreviewBridge/PB-", prompt=prompt, extra_pnginfo=extra_pnginfo)
+                    res = nodes.PreviewImage().save_images(images, filename_prefix="PreviewBridge/PB-", prompt=prompt, extra_pnginfo=extra_pnginfo)
             else:
                 masked_images = utils.tensor_convert_rgba(images)
                 resized_mask = utils.resize_mask(mask, (images.shape[1], images.shape[2])).unsqueeze(3)

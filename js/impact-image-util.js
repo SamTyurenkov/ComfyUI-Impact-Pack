@@ -109,6 +109,38 @@ app.registerExtension({
 			node._imgs = [new Image()];
 			node.imageIndex = 0;
 
+			const syncMaskEditorImage = async () => {
+				const serverItem = Array.isArray(node.images) ? node.images[0] : null;
+				if(!serverItem?.filename?.startsWith("clipspace-painted-masked-")) {
+					return;
+				}
+
+				const source = getAnnotatedPath(serverItem);
+				if(!source) {
+					return;
+				}
+
+				const image = new Image();
+				const widgetIndex = node.widgets.indexOf(w);
+				w._value = source;
+				if(widgetIndex >= 0 && Array.isArray(node.widgets_values)) {
+					node.widgets_values[widgetIndex] = source;
+				}
+
+				w._lock = true;
+				try {
+					w._value = await loadImageFromUrl(image, node.id, source, true);
+					if(widgetIndex >= 0 && Array.isArray(node.widgets_values)) {
+						node.widgets_values[widgetIndex] = w._value;
+					}
+					node._imgs = [image];
+					node.setDirtyCanvas?.(true, true);
+				}
+				finally {
+					w._lock = false;
+				}
+			};
+
 			Object.defineProperty(w, 'value', {
 				async set(v) {
 					if(w._lock)
@@ -158,6 +190,7 @@ app.registerExtension({
 				set(v) {
 					if(v === undefined || v === null) {
 						if(node._imgs?.length) {
+							setTimeout(() => syncMaskEditorImage(), 0);
 							return;
 						}
 						node._imgs = [];
